@@ -1,4 +1,6 @@
 from setuptools import find_packages, setup
+import os
+from glob import glob
 
 package_name = 'guide_bringup'
 
@@ -10,6 +12,8 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
+        # Install route files into share/guide_bringup/routes.
+        (os.path.join('share', package_name, 'routes'), glob('routes/*.yaml')),
     ],
     install_requires=['setuptools'],
     zip_safe=True,

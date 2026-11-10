@@ -8,7 +8,7 @@ find_package(rosidl_default_generators REQUIRED)
 
 # Generate Python and C++ code from our message definitions
 rosidl_generate_interfaces(${PROJECT_NAME}
-  "msg/GuidanceCommand.msg"
+  "msg/RouteProgress.msg"
   DEPENDENCIES std_msgs
 )
 
