@@ -24,6 +24,9 @@ setup(
     },
     entry_points={
         'console_scripts': [
+            # command name = python.module.path:function
+            # "ros2 run guide_nodes localizer" runs main() in localizer_node.py
+            'localizer = guide_nodes.localizer_node:main',
         ],
     },
 )
