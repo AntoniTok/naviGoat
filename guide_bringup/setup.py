@@ -14,6 +14,7 @@ setup(
         ('share/' + package_name, ['package.xml']),
         # Install route files into share/guide_bringup/routes.
         (os.path.join('share', package_name, 'routes'), glob('routes/*.yaml')),
+        (os.path.join('share', package_name, 'launch'), glob('launch/*.launch.py')),
     ],
     install_requires=['setuptools'],
     zip_safe=True,

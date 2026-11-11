@@ -14,6 +14,9 @@ from guide_core.route import Route
 
 #: Goals whose distance along the route differs by less than this (m) are the same goal.
 _SAME_S = 1e-9
+#: Goal positions closer than this (m) are the same goal. Positions are copied
+#: exactly through ROS messages, so this only absorbs floating-point rounding.
+_SAME_POINT = 1e-3
 
 
 @dataclass(frozen=True)
@@ -193,6 +196,35 @@ class RouteFollower:
             new_goal=new_goal,
         )
 
+
+    def confirm_goal_reached(self, x: float, y: float) -> bool:
+        """Tell the follower that Nav2 reached the goal at (x, y) (map frame, metres).
+
+        This is the corner safety net. Nav2 stops a little short of a goal
+        (~0.25 m) and reports success. If a corner goal is reached like that
+        before the robot is within corner_release_distance of it, the goal
+        would stay held at the corner forever and the robot would never move
+        again. So a confirmed corner goal is released here; the next update()
+        then chooses a goal past it.
+
+        Only the current goal counts: a position that is not the current goal
+        (a stale or unrelated success) changes nothing. Lookahead and final
+        goals change nothing either; arrival is decided by update() alone.
+
+        Returns:
+            True if a corner was released, False otherwise.
+        """
+        goal = self._goal
+        if self._arrived or goal is None or not goal.is_corner:
+            return False
+        if math.dist((x, y), (goal.x, goal.y)) > _SAME_POINT:
+            return False  # not our current goal
+        if goal.s <= self._released_s:
+            return False  # already released
+        self._released_s = goal.s
+        return True
+
+
     def _release_corners(self, s: float) -> None:
         """Release every corner the robot is within corner_release_distance of.
 
@@ -242,12 +274,18 @@ class RouteFollower:
         )
 
     def _should_send(self, candidate: Goal) -> bool:
-        """Decide whether candidate replaces the current goal."""
+        """Decide whether candidate replaces the current goal.
+
+        Corner and final goals are always sent, and so is any goal that moves
+        off a held corner: otherwise, with a lookahead shorter than
+        goal_update_distance, a released corner could stay Nav2's goal and the
+        robot would park there.
+        """
         if self._goal is None:
             return True
         change = abs(candidate.s - self._goal.s)
         if change < _SAME_S:
             return False  # same goal: never resend
-        if candidate.is_corner or candidate.is_final:
-            return True   # Nav2 must aim exactly at corners and the end
+        if candidate.is_corner or candidate.is_final or self._goal.is_corner:
+            return True   # Nav2 must aim exactly at corners and the end, and leave corners promptly
         return change >= self._config.goal_update_distance

@@ -28,6 +28,7 @@ setup(
             # "ros2 run guide_nodes localizer" runs main() in localizer_node.py
             'localizer = guide_nodes.localizer_node:main',
             'route_follower = guide_nodes.route_follower_node:main',
+            'goal_sender = guide_nodes.goal_sender_node:main',
         ],
     },
 )

@@ -5,11 +5,13 @@ project(guide_interfaces)
 find_package(ament_cmake REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
+find_package(geometry_msgs REQUIRED)
 
 # Generate Python and C++ code from our message definitions
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/RouteProgress.msg"
-  DEPENDENCIES std_msgs
+  "msg/NavGoalStatus.msg"
+  DEPENDENCIES std_msgs geometry_msgs
 )
 
 # Make sure anything using our messages also gets the runtime support

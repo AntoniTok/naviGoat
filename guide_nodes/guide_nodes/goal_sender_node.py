@@ -1,0 +1,293 @@
+"""Goal sender node: forwards route goals to Nav2's NavigateToPose action.
+
+Subscribes to guide/next_goal (from the route follower), sends each goal to the
+navigate_to_pose action server (Nav2 on the robot, the fake server in guide_sim),
+and publishes what happened to it on guide/goal_status.
+"""
+
+import math
+
+import rclpy
+from rclpy.action import ActionClient
+from rclpy.executors import ExternalShutdownException
+from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+from rclpy.signals import SignalHandlerOptions
+
+from action_msgs.msg import GoalStatus
+from geometry_msgs.msg import PoseStamped
+from nav2_msgs.action import NavigateToPose
+
+from guide_core.angles import quaternion_to_yaw
+from guide_interfaces.msg import NavGoalStatus
+
+
+# Latched QoS for rarely-changing state topics (same profile as the route follower uses).
+# RELIABLE: every message is delivered (resent if lost).
+# TRANSIENT_LOCAL: the publisher keeps its last message (depth 1) and hands it to any
+# subscriber that connects later, so late-starting nodes still get the current state.
+# Both sides must use TRANSIENT_LOCAL for the late-joiner delivery to happen.
+LATCHED_QOS = QoSProfile(
+    depth=1,
+    reliability=ReliabilityPolicy.RELIABLE,
+    durability=DurabilityPolicy.TRANSIENT_LOCAL,
+)
+
+# When an action goal ends, the server reports an action_msgs/GoalStatus code
+# (STATUS_SUCCEEDED=4, STATUS_CANCELED=5, STATUS_ABORTED=6). This maps them to our own
+# NavGoalStatus codes. Anything unexpected is treated as ABORTED.
+RESULT_TO_STATUS = {
+    GoalStatus.STATUS_SUCCEEDED: NavGoalStatus.SUCCEEDED,
+    GoalStatus.STATUS_ABORTED: NavGoalStatus.ABORTED,
+    GoalStatus.STATUS_CANCELED: NavGoalStatus.CANCELED,
+}
+
+# Readable names for log lines.
+ACTION_STATUS_NAMES = {
+    GoalStatus.STATUS_SUCCEEDED: 'SUCCEEDED',
+    GoalStatus.STATUS_ABORTED: 'ABORTED',
+    GoalStatus.STATUS_CANCELED: 'CANCELED',
+}
+
+
+class GoalSenderNode(Node):
+    """Forwards every goal from guide/next_goal to NavigateToPose and reports the outcome."""
+
+    def __init__(self):
+        super().__init__('goal_sender')
+
+        # Parameters (all optional). action_name is the action server to talk to;
+        # retry_period is how often we check whether a waiting goal can be sent yet;
+        # feedback_log_period limits how often feedback is logged; cancel_timeout is
+        # how long shutdown waits for the server to answer our cancel request.
+        self.declare_parameter('action_name', 'navigate_to_pose')
+        self.declare_parameter('retry_period', 1.0)
+        self.declare_parameter('feedback_log_period', 5.0)
+        self.declare_parameter('cancel_timeout', 1.0)
+        self._action_name = self.get_parameter('action_name').value
+        retry_period = float(self.get_parameter('retry_period').value)
+        self._feedback_log_period = float(self.get_parameter('feedback_log_period').value)
+        self._cancel_timeout = float(self.get_parameter('cancel_timeout').value)
+
+        # Goal bookkeeping.
+        # _seq: number of the newest goal received (1, 2, 3...). Every callback remembers
+        #   the number of the goal it belongs to; if that is not _seq, the callback is
+        #   about an older goal and is "stale" (decision 3).
+        # _goal: newest goal exactly as received (its original stamp is kept for matching).
+        # _unsent: True while the newest goal has not been sent yet (e.g. server not up).
+        # _active_handle / _active_seq: the accepted goal Nav2 is currently working on,
+        #   so we can cancel it on shutdown.
+        self._seq = 0
+        self._goal = None
+        self._unsent = False
+        self._active_handle = None
+        self._active_seq = 0
+
+        # Action client for nav2_msgs/action/NavigateToPose. An action is a long-running
+        # request: the client sends a goal, the server accepts or rejects it, streams
+        # feedback while working, and finally returns a result with a status
+        # (SUCCEEDED / ABORTED / CANCELED). Nav2 serves it under the name navigate_to_pose.
+        self._client = ActionClient(self, NavigateToPose, self._action_name)
+
+        # Status publisher: latched, published only when the status changes.
+        self._status_pub = self.create_publisher(NavGoalStatus, 'guide/goal_status', LATCHED_QOS)
+
+        # Goal subscriber: guide/next_goal is latched by the route follower, so we must
+        # subscribe with TRANSIENT_LOCAL too, to receive the current goal even if we
+        # start after the follower published it.
+        self._goal_sub = self.create_subscription(
+            PoseStamped, 'guide/next_goal', self._on_next_goal, LATCHED_QOS)
+
+        # Timer: retries sending a goal that is waiting for the action server. It also
+        # wakes the executor at least once per retry_period, which lets Ctrl+C get
+        # through quickly (see main()).
+        self._timer = self.create_timer(retry_period, self._try_send)
+
+        self.get_logger().info(
+            f"Goal sender started: guide/next_goal -> action '{self._action_name}'")
+
+    # ---- Incoming goals ------------------------------------------------------------
+
+    # Called for every message on guide/next_goal. A new goal always replaces the old
+    # one: we do not cancel the old goal, we just send the new one and the action
+    # server preempts the old one (decision 3: no stop between goals).
+    def _on_next_goal(self, msg):
+        p = msg.pose.position
+        if not msg.header.frame_id or not (math.isfinite(p.x) and math.isfinite(p.y)):
+            self.get_logger().warn(
+                'Ignoring invalid goal (empty frame_id or non-finite position)',
+                throttle_duration_sec=5.0)
+            return
+
+        self._seq += 1
+        self._goal = msg
+        self._unsent = True
+
+        q = msg.pose.orientation
+        yaw_deg = math.degrees(quaternion_to_yaw(q.x, q.y, q.z, q.w))
+        self.get_logger().info(
+            f'Goal #{self._seq} received: x={p.x:.2f} y={p.y:.2f} yaw={yaw_deg:.1f} deg '
+            f'(frame {msg.header.frame_id})')
+
+        self._publish_status(NavGoalStatus.PENDING)
+        self._try_send()
+
+    # ---- Sending -------------------------------------------------------------------
+
+    # Sends the newest goal if it is unsent and the action server is available.
+    # Called right after a goal arrives and again by the timer, so a goal received
+    # before Nav2 is up gets sent as soon as it is up. Never blocks (decision 8).
+    def _try_send(self):
+        if not self._unsent:
+            return
+        # server_is_ready() only checks the current state; it does not wait.
+        if not self._client.server_is_ready():
+            self.get_logger().warn(
+                f"Goal #{self._seq} waiting: action server '{self._action_name}' "
+                'not available', throttle_duration_sec=5.0)
+            return
+
+        self._unsent = False
+        seq = self._seq
+
+        # Build the NavigateToPose goal. Same frame and pose as received, but the stamp
+        # is left at zero, meaning "use the latest available transform" (decision 6).
+        # behavior_tree = '' tells Nav2 to use its default behaviour tree.
+        goal = NavigateToPose.Goal()
+        goal.pose.header.frame_id = self._goal.header.frame_id
+        goal.pose.pose = self._goal.pose
+        goal.behavior_tree = ''
+
+        # send_goal_async() returns immediately with a future (a placeholder for a reply
+        # that arrives later). The executor calls the done-callback when the server
+        # answers accept/reject. The lambdas capture seq via "seq=seq" so each callback
+        # remembers which goal it belongs to (a plain closure would see later values).
+        send_future = self._client.send_goal_async(
+            goal, feedback_callback=lambda fb, seq=seq: self._on_feedback(seq, fb))
+        send_future.add_done_callback(
+            lambda future, seq=seq: self._on_goal_response(seq, future))
+        self.get_logger().info(f"Goal #{seq} sent to '{self._action_name}'")
+
+    # ---- Action callbacks ----------------------------------------------------------
+
+    # Stage 2: the server accepted or rejected the goal. future.result() is a goal
+    # handle; .accepted tells which. If accepted, we ask for the result (stage 3),
+    # which arrives later through another future.
+    def _on_goal_response(self, seq, future):
+        goal_handle = future.result()
+
+        if not goal_handle.accepted:
+            if seq == self._seq:
+                self.get_logger().error(f"Goal #{seq} REJECTED by '{self._action_name}'")
+                self._publish_status(NavGoalStatus.REJECTED,
+                                     message='goal rejected by action server')
+            return
+
+        # Still ask for the result of an accepted stale goal, only so its end is logged.
+        result_future = goal_handle.get_result_async()
+        result_future.add_done_callback(lambda f, seq=seq: self._on_result(seq, f))
+
+        if seq != self._seq:
+            self.get_logger().info(
+                f'Goal #{seq} accepted, but goal #{self._seq} is newer and will replace it')
+            return
+
+        self._active_handle = goal_handle
+        self._active_seq = seq
+        self.get_logger().info(f'Goal #{seq} accepted')
+        self._publish_status(NavGoalStatus.ACTIVE)
+
+    # Called repeatedly while a goal runs (about 10 Hz). feedback_msg.feedback holds
+    # the NavigateToPose feedback fields. Logged at most once per feedback_log_period.
+    def _on_feedback(self, seq, feedback_msg):
+        if seq != self._seq:
+            return
+        fb = feedback_msg.feedback
+        self.get_logger().info(
+            f'Goal #{seq}: distance_remaining={fb.distance_remaining:.1f} m',
+            throttle_duration_sec=self._feedback_log_period)
+
+    # Stage 3: the goal has ended. future.result() has .status (an action_msgs/GoalStatus
+    # code) and .result (NavigateToPose result: error_code, error_msg).
+    def _on_result(self, seq, future):
+        response = future.result()
+        action_status = response.status
+        result = response.result
+        name = ACTION_STATUS_NAMES.get(action_status, f'status {action_status}')
+
+        if seq == self._active_seq:
+            self._active_handle = None
+
+        # Stale: a newer goal was sent after this one. Its ABORTED is just the
+        # preemption by our own newer goal, not a navigation failure (decision 3).
+        if seq != self._seq:
+            self.get_logger().info(
+                f'Goal #{seq} ended ({name}) after being replaced by goal #{self._seq}; ignored')
+            return
+
+        status = RESULT_TO_STATUS.get(action_status, NavGoalStatus.ABORTED)
+        message = result.error_msg or ('' if status == NavGoalStatus.SUCCEEDED else name)
+        if status == NavGoalStatus.SUCCEEDED:
+            self.get_logger().info(f'Goal #{seq} SUCCEEDED')
+        elif status == NavGoalStatus.CANCELED:
+            self.get_logger().warn(f'Goal #{seq} CANCELED')
+        else:
+            self.get_logger().error(
+                f'Goal #{seq} {name}: error_code={result.error_code} {result.error_msg}')
+        self._publish_status(status, error_code=result.error_code, message=message)
+
+    # ---- Status --------------------------------------------------------------------
+
+    # Publishes NavGoalStatus for the newest goal. goal is copied exactly as received
+    # (original stamp included) so the route follower can match it to its own goal.
+    def _publish_status(self, status, error_code=0, message=''):
+        msg = NavGoalStatus()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = self._goal.header.frame_id
+        msg.goal = self._goal
+        msg.status = status
+        msg.error_code = error_code
+        msg.message = message
+        self._status_pub.publish(msg)
+
+    # ---- Shutdown ------------------------------------------------------------------
+
+    # Best-effort cancel of the goal Nav2 is working on, so the robot does not keep
+    # driving towards a point up to 25 m away with no guidance layer running.
+    # Called from main() after spinning has stopped, so waiting here with
+    # spin_until_future_complete is safe (inside a callback it would deadlock).
+    def cancel_active_goal(self):
+        if self._active_handle is None:
+            return
+        self.get_logger().info(f'Shutting down: cancelling goal #{self._active_seq}')
+        future = self._active_handle.cancel_goal_async()
+        rclpy.spin_until_future_complete(self, future, timeout_sec=self._cancel_timeout)
+        if future.done():
+            self.get_logger().info(
+                f'Cancel request answered (return_code={future.result().return_code})')
+        else:
+            self.get_logger().warn(
+                f'No answer to cancel request within {self._cancel_timeout:.1f} s')
+
+
+def main(args=None):
+    # SignalHandlerOptions.NO: do not install rclpy's own Ctrl+C handler. That handler
+    # shuts the ROS context down immediately, which would make it impossible to send
+    # the cancel request afterwards. Without it, Ctrl+C raises a normal Python
+    # KeyboardInterrupt (within about a second, because our timer wakes the executor),
+    # and the ROS context is still alive in the finally block.
+    rclpy.init(args=args, signal_handler_options=SignalHandlerOptions.NO)
+    node = GoalSenderNode()
+    try:
+        rclpy.spin(node)
+    except (KeyboardInterrupt, ExternalShutdownException):
+        pass
+    finally:
+        if rclpy.ok():
+            node.cancel_active_goal()
+        node.destroy_node()
+        rclpy.try_shutdown()
+
+
+if __name__ == '__main__':
+    main()

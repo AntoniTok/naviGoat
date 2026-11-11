@@ -181,3 +181,78 @@ def test_full_pass_along_l_route():
     assert [g.is_final for g in goals] == [False] * 6 + [True]
     assert goals[3].yaw == pytest.approx(math.pi / 2)
     assert arrived_at == pytest.approx(69.0)  # 1.0 m tolerance
+    
+    
+
+
+# --- Corner safety net (confirm_goal_reached) --------------------------------
+
+def parked_at_corner():
+    """Robot parked 0.3 m short of the corner (as the sim does), release distance 0.1 m.
+
+    0.3 m is outside the 0.1 m release distance, so the follower alone never
+    releases the corner: the deadlock the safety net exists for.
+    """
+    f = RouteFollower(L_ROUTE, FollowerConfig(corner_release_distance=0.1))
+    f.update(16.0, 0.0)   # goal held at the corner (40, 0)
+    f.update(39.7, 0.0)   # parked 0.3 m short
+    return f
+
+
+def test_confirm_before_any_goal_returns_false():
+    assert not follower().confirm_goal_reached(25.0, 0.0)
+
+
+def test_confirm_lookahead_goal_returns_false():
+    f = follower()
+    f.update(0.0, 0.0)                                # goal at s = 25
+    assert not f.confirm_goal_reached(25.0, 0.0)
+    assert f.update(0.0, 0.0).new_goal is None        # nothing changed
+    assert f.goal.s == pytest.approx(25.0)
+
+
+def test_corner_deadlock_without_confirm():
+    f = parked_at_corner()
+    for _ in range(10):
+        assert f.update(39.7, 0.0).new_goal is None   # stuck: goal stays at the corner
+    assert f.goal.is_corner
+
+
+def test_confirm_corner_releases_and_next_goal_passes_corner():
+    f = parked_at_corner()
+    assert f.confirm_goal_reached(40.0, 0.0)
+    g = f.update(39.7, 0.0).new_goal                  # 39.7 + 25 = 64.7
+    assert (g.x, g.y, g.s) == pytest.approx((40.0, 24.7, 64.7))
+    assert not g.is_corner
+
+
+def test_confirm_wrong_position_returns_false():
+    f = parked_at_corner()
+    assert not f.confirm_goal_reached(30.0, 0.0)      # stale success for an older goal
+    assert f.update(39.7, 0.0).new_goal is None       # corner still held
+    assert f.goal.is_corner
+
+
+def test_confirm_same_corner_twice_second_returns_false():
+    f = parked_at_corner()
+    assert f.confirm_goal_reached(40.0, 0.0)
+    assert not f.confirm_goal_reached(40.0, 0.0)
+
+
+def test_confirm_final_goal_returns_false():
+    f = follower()
+    f.update(40.0, 5.5)                               # s = 45.5: goal is the final point
+    assert f.goal.is_final
+    assert not f.confirm_goal_reached(40.0, 30.0)
+    assert not f.update(40.0, 5.5).arrived            # arrival is still update()'s decision
+
+
+def test_leaving_corner_goal_always_sent():
+    # Lookahead 3 m < goal_update_distance 5 m: on release the goal moves only
+    # 1.6 m, but it must still be sent or the robot parks at the corner.
+    f = RouteFollower(L_ROUTE, FollowerConfig(lookahead=3.0))
+    f.update(37.5, 0.0)                               # 37.5 + 3 = 40.5: held at the corner
+    assert f.goal.is_corner
+    g = f.update(38.6, 0.0).new_goal                  # released; 38.6 + 3 = 41.6
+    assert g is not None
+    assert (g.x, g.y, g.s) == pytest.approx((40.0, 1.6, 41.6))

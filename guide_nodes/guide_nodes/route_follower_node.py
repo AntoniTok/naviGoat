@@ -20,7 +20,7 @@ from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from guide_core.angles import yaw_to_quaternion
 from guide_core.route import InvalidRouteError, route_from_dict
 from guide_core.route_follower import FollowerConfig, Goal, RouteFollower
-from guide_interfaces.msg import RouteProgress
+from guide_interfaces.msg import NavGoalStatus, RouteProgress
 
 # "Latched" QoS for topics that describe current state and change rarely.
 # RELIABLE: messages are re-sent until received (no silent drops).
@@ -89,6 +89,13 @@ class RouteFollowerNode(Node):
             raise RouteLoadError(f'invalid follower parameter: {e}') from e
         self._follower = RouteFollower(route, config)
         self._arrival_logged = False
+        
+        # Stamp of the last goal published on guide/next_goal. The goal sender
+        # copies it into guide/goal_status, so it tells us which goal a status
+        # is about (see _on_goal_status). None until the first goal.
+        self._last_goal_stamp = None
+        # Robot's s from the latest pose, for log messages only.
+        self._last_robot_s = 0.0
 
         # Publishers. Route and next goal are state, so latched; progress is
         # a 5 Hz stream, so default reliable QoS with a queue of 10.
@@ -100,6 +107,14 @@ class RouteFollowerNode(Node):
         # reliable QoS, so we subscribe with the default too (depth 10).
         self.create_subscription(
             PoseWithCovarianceStamped, 'guide/pose', self._on_pose, 10)
+        
+        
+        # Subscriber to the goal sender's status (corner safety net). It is
+        # published latched, so we subscribe with the same LATCHED_QOS:
+        # TRANSIENT_LOCAL so we still get the latest status if we start later,
+        # RELIABLE so no status change is silently dropped.
+        self.create_subscription(
+            NavGoalStatus, 'guide/goal_status', self._on_goal_status, LATCHED_QOS)
 
         self._publish_route()
         self.get_logger().info(
@@ -158,6 +173,8 @@ class RouteFollowerNode(Node):
         except ValueError as e:
             self.get_logger().warning(f'ignoring pose: {e}', throttle_duration_sec=5.0)
             return
+        
+        self._last_robot_s = out.s
 
         # Progress on every pose. The stamp is copied from the pose, so each
         # output can be traced back to the measurement it came from.
@@ -189,12 +206,54 @@ class RouteFollowerNode(Node):
         msg.pose.position.y = goal.y
         set_yaw(msg.pose, goal.yaw)
         self._goal_pub.publish(msg)
+        self._last_goal_stamp = stamp
 
         kind = 'final' if goal.is_final else 'corner' if goal.is_corner else 'lookahead'
         self.get_logger().info(
             f'New goal ({kind}) at s={goal.s:.1f} m: x={goal.x:.1f} y={goal.y:.1f} '
             f'yaw={math.degrees(goal.yaw):.0f} deg (robot at s={robot_s:.1f} m)')
 
+
+    
+    def _on_goal_status(self, msg: NavGoalStatus) -> None:
+        """Corner safety net: release a corner goal that Nav2 reports as reached.
+
+        Nav2 stops ~0.25 m short of a goal and reports SUCCEEDED. If that
+        happens before the robot is within corner_release_distance of a held
+        corner, the robot would wait at the corner forever. Here a SUCCEEDED
+        for our current corner goal releases it; the next pose then chooses a
+        goal past the corner (goals are only ever chosen in _on_pose).
+        """
+        # Only successes can release a corner. PENDING/ACTIVE/ABORTED/... are
+        # ignored here (the mission manager will use them in Step 7).
+        if msg.status != NavGoalStatus.SUCCEEDED:
+            return
+
+        goal = msg.goal
+        if goal.header.frame_id != self._map_frame:
+            self.get_logger().warning(
+                f"ignoring goal status in frame '{goal.header.frame_id}', "
+                f"expected '{self._map_frame}'",
+                throttle_duration_sec=5.0)
+            return
+
+        # Layer 1 against stale messages: the status must be about the goal we
+        # published last. Each goal's stamp is unique (copied from a pose), and
+        # the goal sender sends it back unchanged. ROS message objects compare
+        # field by field with ==, so this compares sec and nanosec. A status
+        # left over from an older goal, or from before this node started,
+        # fails here.
+        if self._last_goal_stamp is None or goal.header.stamp != self._last_goal_stamp:
+            return
+
+        # Layer 2 (guide_core): position matches the current goal, and it is
+        # a corner that is not yet released. Read the goal first for the log.
+        current = self._follower.goal
+        position = goal.pose.position
+        if self._follower.confirm_goal_reached(position.x, position.y):
+            self.get_logger().info(
+                f'Corner at s={current.s:.1f} m confirmed reached by Nav2: released '
+                f'(robot at s={self._last_robot_s:.1f} m)')
 
 def main(args=None):
     rclpy.init(args=args)
@@ -209,7 +268,8 @@ def main(args=None):
         return 1
 
     # spin() runs callbacks until Ctrl-C. A single-threaded executor is
-    # enough: there is one callback and no blocking work.
+    # enough: the callbacks (pose, goal status) never block, and running one
+    # at a time means they never change the follower at the same moment.
     try:
         rclpy.spin(node)
     except (KeyboardInterrupt, ExternalShutdownException):
