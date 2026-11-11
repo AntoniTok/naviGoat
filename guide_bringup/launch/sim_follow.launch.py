@@ -3,6 +3,8 @@
 Usage:
   ros2 launch guide_bringup sim_follow.launch.py
   ros2 launch guide_bringup sim_follow.launch.py route_file:=/path/to/route.yaml
+  ros2 launch guide_bringup sim_follow.launch.py route_file:=/tmp/planned.yaml \
+      start_x:=-26.86 start_y:=-19.04 start_yaw_deg:=-82.0
 
 The robot follows the route on its own until the route follower logs "Arrived".
 Ctrl+C stops all nodes (the goal sender cancels any active goal first).
@@ -12,6 +14,7 @@ from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue  # NEW
 from launch_ros.substitutions import FindPackageShare
 
 
@@ -28,10 +31,29 @@ def generate_launch_description():
             [FindPackageShare('guide_bringup'), 'routes', 'l_route.yaml']),
         description='Route YAML file (frame_id: map, waypoints in metres)')
 
+    # NEW: where the simulated robot starts (map frame). Defaults = the origin,
+    # facing east. plan_route prints values for the start of a planned route.
+    start_args = [
+        DeclareLaunchArgument('start_x', default_value='0.0',
+                              description='Sim robot start, metres east of the origin'),
+        DeclareLaunchArgument('start_y', default_value='0.0',
+                              description='Sim robot start, metres north of the origin'),
+        DeclareLaunchArgument('start_yaw_deg', default_value='0.0',
+                              description='Sim robot start heading, degrees (0 = east, 90 = north)'),
+    ]
+
     # Each Node action starts one executable (the same as 'ros2 run package executable').
     # output='screen' shows its log lines in this terminal, prefixed with the
     # process name, e.g. [route_follower-3].
-    sim = Node(package='guide_sim', executable='sim_robot', output='screen')
+    # NEW: launch arguments are text; ParameterValue(..., value_type=float)
+    # makes sure '-82' arrives as the float -82.0, because the sim declares these
+    # parameters as floats and ROS rejects an int for a float parameter.
+    sim = Node(
+        package='guide_sim', executable='sim_robot', output='screen',
+        parameters=[{
+            name: ParameterValue(LaunchConfiguration(name), value_type=float)
+            for name in ('start_x', 'start_y', 'start_yaw_deg')
+        }])
     localizer = Node(package='guide_nodes', executable='localizer', output='screen')
 
     # parameters=[{...}] is the launch-file equivalent of --ros-args -p name:=value.
@@ -44,6 +66,7 @@ def generate_launch_description():
 
     return LaunchDescription([
         route_file_arg,
+        *start_args,  # NEW
         sim,
         localizer,
         route_follower,

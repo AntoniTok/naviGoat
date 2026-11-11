@@ -33,6 +33,7 @@ How it fits together:
 """
 import threading
 import time
+import math
 
 # ROS message and action types. Each ROS package generates Python classes from its
 # .msg/.action files; importing them here lets us create and fill those messages.
@@ -53,7 +54,7 @@ from rclpy.qos import qos_profile_sensor_data
 # Our own ROS-free code from guide_core (unit-tested separately).
 from guide_core.angles import yaw_to_quaternion
 from guide_core.geo import enu_to_latlon
-from guide_core.sim_model import SimRobot
+from guide_core.sim_model import RobotState, SimRobot
 
 
 def quaternion_msg(yaw):
@@ -97,6 +98,16 @@ class SimRobotNode(Node):
             max_turn_rate=self.declare_parameter('max_turn_rate', 1.0).value,
             goal_tolerance=self.declare_parameter('goal_tolerance', 0.3).value,
         )
+        
+        # Where the robot starts, in the map frame: metres east (x) and north (y)
+        # of the origin, heading in degrees (0 = east, 90 = north, REP 103).
+        # The defaults put it at the origin facing east, as before; plan_route
+        # prints values that put it on the first point of a planned route.
+        # Replacing the model's state is safe here: no timer has run yet.
+        start_x = self.declare_parameter('start_x', 0.0).value
+        start_y = self.declare_parameter('start_y', 0.0).value
+        start_yaw_deg = self.declare_parameter('start_yaw_deg', 0.0).value
+        self.robot.state = RobotState(x=start_x, y=start_y, yaw=math.radians(start_yaw_deg))
         
         # Seconds of simulated time per physics step (0.05 s at 20 Hz).
         self.dt = 1.0 / rate_hz
@@ -155,7 +166,8 @@ class SimRobotNode(Node):
         # get_logger() prints timestamped messages tagged with the node name.
         # Prefer it over print(): output can be filtered by severity and recorded.
         self.get_logger().info(
-            f'Simulated robot ready, origin ({self.origin_lat}, {self.origin_lon})')
+            f'Simulated robot ready, origin ({self.origin_lat}, {self.origin_lon}), '
+            f'start ({start_x:.2f}, {start_y:.2f}) m, heading {start_yaw_deg:.1f} deg')
 
     # ------------------------------------------------------------------
     # Simulation and sensors
@@ -187,7 +199,9 @@ class SimRobotNode(Node):
         #                                    'pose' also holds its uncertainty)
         #   twist.twist                   -> velocity: linear.x = forward speed (m/s),
         #                                    angular.z = turning rate (rad/s)
-        # In this sim the robot starts at the map origin, so odom and map coincide.
+        # Simplification: this sim reports odometry in map coordinates, even when
+        # the robot starts away from the origin. A real robot's odom starts at
+        # (0, 0) wherever it is switched on. Nothing uses odom yet (Step 8 will).
         odom = Odometry()
         odom.header.stamp = stamp
         odom.header.frame_id = 'odom'

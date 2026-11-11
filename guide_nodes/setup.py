@@ -29,6 +29,9 @@ setup(
             'localizer = guide_nodes.localizer_node:main',
             'route_follower = guide_nodes.route_follower_node:main',
             'goal_sender = guide_nodes.goal_sender_node:main',
+            'route_planner = guide_nodes.route_planner_node:main',  
+            'fetch_osm_graph = guide_nodes.fetch_osm_graph:main',   
+            'plan_route = guide_nodes.plan_route_cli:main',      
         ],
     },
 )

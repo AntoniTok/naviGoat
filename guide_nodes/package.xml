@@ -16,9 +16,13 @@
   <depend>guide_core</depend>
   <depend>guide_interfaces</depend>
   <depend>action_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>visualization_msgs</depend>
 
   <exec_depend>python3-yaml</exec_depend>
-
+    <!-- osmnx (route_planner, fetch_osm_graph) has no rosdep key: install it with pip,
+       pinned to the apt versions in apt_pins.txt (exact command in the README). -->
+       
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>
   <test_depend>ament_pep257</test_depend>
