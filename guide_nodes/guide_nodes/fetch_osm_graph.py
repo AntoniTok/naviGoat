@@ -18,7 +18,7 @@ import osmnx as ox
 import yaml
 # Road types (major/minor) shared with the planner's cost model, so crossing
 # labels and costs always agree.
-from guide_core.walk_costs import MAJOR_ROADS, MINOR_ROADS
+from guide_core.walk_costs import MAJOR_ROADS, MINOR_ROADS, is_road
 
 # Same origin as the localizer: the centre of the local east-north (map) frame.
 DEFAULT_ORIGIN_LAT = 51.4988
@@ -30,11 +30,11 @@ DEFAULT_ORIGIN_LON = -0.1749
 # the short way across the road (footway=crossing), so we keep both.
 EXTRA_NODE_TAGS = [
     'crossing', 'crossing:signals', 'crossing:markings', 'crossing_ref',
-    'tactile_paving',
+    'tactile_paving', 'crossing:island', 'traffic_calming',
 ]
 EXTRA_WAY_TAGS = [
     'footway', 'crossing', 'crossing:signals', 'crossing:markings',
-    'crossing_ref', 'tactile_paving', 'sidewalk', 'foot',
+    'crossing_ref', 'tactile_paving', 'sidewalk', 'foot', 'crossing:island',
 ]
 
 
@@ -54,12 +54,13 @@ def parse_args(argv=None):
                              '(default: osmnx default, overpass-api.de)')
     return parser.parse_args(argv)
 
-
 def summarise(graph):
-    """Return printable lines describing the graph's size, crossings and walkway types."""
+    """Return printable lines describing the graph's size, crossings, islands and walkway types."""
     crossing_nodes = Counter()
     node_signals = Counter()
     node_refs = Counter()
+    node_island = Counter()        # crossing:island=* values on nodes
+    node_calming = Counter()       # traffic_calming=* values on nodes
     for _, data in graph.nodes(data=True):
         if data.get('highway') == 'crossing':
             crossing_nodes[str(data.get('crossing', '(no crossing= tag)'))] += 1
@@ -67,12 +68,17 @@ def summarise(graph):
                 node_signals[str(data['crossing:signals'])] += 1
             if 'crossing_ref' in data:
                 node_refs[str(data['crossing_ref'])] += 1
+        if 'crossing:island' in data:
+            node_island[str(data['crossing:island'])] += 1
+        if 'traffic_calming' in data:
+            node_calming[str(data['traffic_calming'])] += 1
 
     # Walking graphs are two-way: every walkway is stored as two directed
     # edges. Count each pair of nodes once so the numbers match the real map.
     seen = set()
     crossing_ways = Counter()
     walkway_types = Counter()
+    island_pieces = 0
     for u, v, data in graph.edges(data=True):
         pair = (min(u, v), max(u, v))
         if pair in seen:
@@ -81,6 +87,8 @@ def summarise(graph):
         walkway_types[str(data.get('highway', '(none)'))] += 1
         if data.get('footway') == 'crossing':
             crossing_ways[str(data.get('crossing', '(no crossing= tag)'))] += 1
+        if data.get('footway') == 'traffic_island':
+            island_pieces += 1
 
     return [
         f'Nodes: {graph.number_of_nodes()}, directed edges: {graph.number_of_edges()} '
@@ -89,8 +97,12 @@ def summarise(graph):
         f'  ... with crossing:signals=: {dict(node_signals.most_common())}',
         f'  ... with crossing_ref=: {dict(node_refs.most_common())}',
         f'Crossing way pieces (footway=crossing), by crossing=: {dict(crossing_ways.most_common())}',
+        f'Pedestrian island pieces (footway=traffic_island): {island_pieces}',
+        f'Island-tagged nodes: crossing:island= {dict(node_island.most_common())}, '
+        f'traffic_calming= {dict(node_calming.most_common())}',
         f'Walkway pieces by highway= (top 12): {dict(walkway_types.most_common(12))}',
     ]
+    
     
 def annotate_crossed_roads(walk, roads):
     """Label each crossing node with the class of road it crosses.
@@ -120,6 +132,33 @@ def annotate_crossed_roads(walk, roads):
             data['crossed_road'] = 'none'  # no public road here (e.g. a cycle track)
         counts[data['crossed_road']] += 1
     return counts
+
+def annotate_major_junctions(walk, roads):
+    """Mark walk-graph nodes where a major road meets other roads.
+
+    Walking along a minor road through such a node means crossing the major
+    road with no crossing facility; the planner charges and reports it. A
+    junction needs at least 3 road directions, so an ordinary point along a
+    major road is not one. Directions are counted from both graphs: the road
+    graph knows roads the walk graph dropped (e.g. Cromwell Road, whose
+    pavements are mapped separately), the walk graph knows streets closed to
+    cars (e.g. a shared street). Sets junction_major='yes'; returns the count.
+    """
+    count = 0
+    for node, data in walk.nodes(data=True):
+        neighbours, types = set(), set()
+        for graph in (walk, roads):
+            if node not in graph:
+                continue
+            for u, v, edge in list(graph.in_edges(node, data=True)) + \
+                    list(graph.out_edges(node, data=True)):
+                if is_road(edge.get('highway')):
+                    neighbours.add(v if u == node else u)
+                    types.add(str(edge.get('highway')))
+        if len(neighbours) >= 3 and types & MAJOR_ROADS:
+            data['junction_major'] = 'yes'
+            count += 1
+    return count
 
 def download_with_retries(what, attempts=4, first_wait=30.0, **kwargs):
     """Call ox.graph_from_point(**kwargs), retrying with doubling waits on failure.
@@ -175,6 +214,7 @@ def main(argv=None):
                                   dist=args.dist, network_type='drive_service',
                                   simplify=False, retain_all=True)
     crossed_counts = annotate_crossed_roads(graph, roads)
+    junction_count = annotate_major_junctions(graph, roads)
 
     ox.save_graphml(graph, filepath=out_path)
 
@@ -192,6 +232,7 @@ def main(argv=None):
         'nodes': graph.number_of_nodes(),
         'directed_edges': graph.number_of_edges(),
         'crossing_nodes_by_road_crossed': dict(crossed_counts),
+        'major_road_junctions': junction_count,
         'attribution': '(c) OpenStreetMap contributors, ODbL',
     }
     with open(meta_path, 'w', encoding='utf-8') as f:
@@ -204,7 +245,8 @@ def main(argv=None):
         print(line)
         
     print(f'Crossing nodes by road crossed: {dict(crossed_counts.most_common())}')
-
+    print(f'Junctions with a major road (junction_major=yes): {junction_count}')
+        
 
 if __name__ == '__main__':
     main()

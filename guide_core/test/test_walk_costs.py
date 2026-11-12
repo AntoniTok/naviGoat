@@ -106,7 +106,7 @@ def test_crossing_penalty_table(crossing_type, road, expected):
 
 def test_cost_config_defaults():
     c = CostConfig()
-    assert (c.minor_road_factor, c.major_road_factor) == (3.0, 10.0)
+    assert (c.minor_road_factor, c.major_road_factor) == (10.0, 50.0)
     assert (c.signalled_minor, c.unsignalled_minor, c.unknown_minor) == (10.0, 30.0, 40.0)
     assert (c.signalled_major, c.unsignalled_major, c.unknown_major) == (20.0, 300.0, 300.0)
 
@@ -129,12 +129,12 @@ def test_plain_footway_costs_its_length():
     assert edge_cost(10.0, FOOTWAY, {}, {}) == pytest.approx(10.0)
 
 
-def test_minor_road_costs_three_times_length():
-    assert edge_cost(10.0, {'highway': 'residential'}, {}, {}) == pytest.approx(30.0)
+def test_minor_road_costs_ten_times_length():
+    assert edge_cost(10.0, {'highway': 'residential'}, {}, {}) == pytest.approx(100.0)
 
 
-def test_major_road_costs_ten_times_length():
-    assert edge_cost(10.0, {'highway': 'primary'}, {}, {}) == pytest.approx(100.0)
+def test_major_road_costs_fifty_times_length():
+    assert edge_cost(10.0, {'highway': 'primary'}, {}, {}) == pytest.approx(500.0)
 
 
 def test_steps_are_forbidden():
@@ -153,7 +153,7 @@ def test_leaving_crossing_node_is_not_charged():
 
 def test_road_edge_into_crossing_node_is_not_charged():
     node = crossing_node(crossing='unmarked', crossed_road='minor')
-    assert edge_cost(5.0, {'highway': 'residential'}, {}, node) == pytest.approx(15.0)
+    assert edge_cost(5.0, {'highway': 'residential'}, {}, node) == pytest.approx(50.0)
 
 
 def test_unknown_crossed_road_counts_as_major():

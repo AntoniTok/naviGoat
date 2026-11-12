@@ -3,6 +3,11 @@
 Subscribes to guide/next_goal (from the route follower), sends each goal to the
 navigate_to_pose action server (Nav2 on the robot, the fake server in guide_sim),
 and publishes what happened to it on guide/goal_status.
+
+The user can pause anywhere (guide/pause): the active Nav2 goal is cancelled
+so the robot stops, and new goals are held. guide/resume re-sends the latest
+goal. The route follower keeps running throughout, so no route progress or
+guidance is lost. guide/paused reports the current state.
 """
 
 import math
@@ -17,6 +22,8 @@ from rclpy.signals import SignalHandlerOptions
 from action_msgs.msg import GoalStatus
 from geometry_msgs.msg import PoseStamped
 from nav2_msgs.action import NavigateToPose
+from std_msgs.msg import Bool
+from std_srvs.srv import Trigger
 
 from guide_core.angles import quaternion_to_yaw
 from guide_interfaces.msg import NavGoalStatus
@@ -82,6 +89,11 @@ class GoalSenderNode(Node):
         self._unsent = False
         self._active_handle = None
         self._active_seq = 0
+        # _paused: True between guide/pause and guide/resume; no goal is sent then.
+        # _succeeded_seq: number of the last goal Nav2 reported SUCCEEDED, so resume
+        #   does not re-send a goal that was already reached (e.g. a crossing stop).
+        self._paused = False
+        self._succeeded_seq = 0
 
         # Action client for nav2_msgs/action/NavigateToPose. An action is a long-running
         # request: the client sends a goal, the server accepts or rejects it, streams
@@ -91,6 +103,20 @@ class GoalSenderNode(Node):
 
         # Status publisher: latched, published only when the status changes.
         self._status_pub = self.create_publisher(NavGoalStatus, 'guide/goal_status', LATCHED_QOS)
+
+        # Pause state publisher: latched like the status, so a node that starts later
+        # (mission manager, RViz) still learns whether we are paused. std_msgs/Bool
+        # has a single field, 'data'.
+        self._paused_pub = self.create_publisher(Bool, 'guide/paused', LATCHED_QOS)
+        self._paused_pub.publish(Bool(data=False))
+
+        # Pause / resume services. std_srvs/Trigger has an empty request and a
+        # response with 'bool success' and 'string message'. Called from the CLI in
+        # sim (ros2 service call /guide/pause std_srvs/srv/Trigger), from Step 7 by
+        # the mission manager (pole-handle button). The single-threaded executor runs
+        # them between the other callbacks, never at the same time, so no lock.
+        self.create_service(Trigger, 'guide/pause', self._on_pause)
+        self.create_service(Trigger, 'guide/resume', self._on_resume)
 
         # Goal subscriber: guide/next_goal is latched by the route follower, so we must
         # subscribe with TRANSIENT_LOCAL too, to receive the current goal even if we
@@ -125,9 +151,10 @@ class GoalSenderNode(Node):
 
         q = msg.pose.orientation
         yaw_deg = math.degrees(quaternion_to_yaw(q.x, q.y, q.z, q.w))
+        held = ', held while paused' if self._paused else ''
         self.get_logger().info(
             f'Goal #{self._seq} received: x={p.x:.2f} y={p.y:.2f} yaw={yaw_deg:.1f} deg '
-            f'(frame {msg.header.frame_id})')
+            f'(frame {msg.header.frame_id}){held}')
 
         self._publish_status(NavGoalStatus.PENDING)
         self._try_send()
@@ -138,8 +165,8 @@ class GoalSenderNode(Node):
     # Called right after a goal arrives and again by the timer, so a goal received
     # before Nav2 is up gets sent as soon as it is up. Never blocks (decision 8).
     def _try_send(self):
-        if not self._unsent:
-            return
+        if not self._unsent or self._paused:
+            return  # nothing to send, or held until guide/resume
         # server_is_ready() only checks the current state; it does not wait.
         if not self._client.server_is_ready():
             self.get_logger().warn(
@@ -197,6 +224,10 @@ class GoalSenderNode(Node):
         self.get_logger().info(f'Goal #{seq} accepted')
         self._publish_status(NavGoalStatus.ACTIVE)
 
+        # Paused while this goal was on its way to the server: cancel it now.
+        if self._paused:
+            self._cancel_active('accepted after pause')
+
     # Called repeatedly while a goal runs (about 10 Hz). feedback_msg.feedback holds
     # the NavigateToPose feedback fields. Logged at most once per feedback_log_period.
     def _on_feedback(self, seq, feedback_msg):
@@ -228,6 +259,7 @@ class GoalSenderNode(Node):
         status = RESULT_TO_STATUS.get(action_status, NavGoalStatus.ABORTED)
         message = result.error_msg or ('' if status == NavGoalStatus.SUCCEEDED else name)
         if status == NavGoalStatus.SUCCEEDED:
+            self._succeeded_seq = seq
             self.get_logger().info(f'Goal #{seq} SUCCEEDED')
         elif status == NavGoalStatus.CANCELED:
             self.get_logger().warn(f'Goal #{seq} CANCELED')
@@ -249,6 +281,62 @@ class GoalSenderNode(Node):
         msg.error_code = error_code
         msg.message = message
         self._status_pub.publish(msg)
+
+    # ---- Pause / resume ------------------------------------------------------------
+
+    # guide/pause: stop the robot where it is. The active goal is cancelled (the
+    # server then reports CANCELED, which we publish as usual; the follower ignores
+    # it). Goals arriving while paused are kept as the newest goal but not sent.
+    def _on_pause(self, request, response):
+        if self._paused:
+            response.success, response.message = False, 'Already paused'
+            return response
+        self._paused = True
+        self._paused_pub.publish(Bool(data=True))
+        if self._active_handle is not None:
+            self._cancel_active('paused by request')
+            response.message = f'Paused: cancelling goal #{self._active_seq}'
+        else:
+            response.message = 'Paused (no active Nav2 goal)'
+        response.success = True
+        self.get_logger().info(response.message)
+        return response
+
+    # guide/resume: send the newest goal again, unless Nav2 already reached it.
+    # It gets a new sequence number, so any late result of the cancelled goal is
+    # stale and ignored. The goal message itself is unchanged (original stamp), so
+    # the route follower still recognises its status.
+    def _on_resume(self, request, response):
+        if not self._paused:
+            response.success, response.message = False, 'Not paused'
+            return response
+        self._paused = False
+        self._paused_pub.publish(Bool(data=False))
+        response.success = True
+        if self._goal is None:
+            response.message = 'Resumed (no goal to send)'
+        elif self._succeeded_seq == self._seq:
+            response.message = 'Resumed (current goal already reached, nothing to send)'
+        else:
+            self._seq += 1
+            self._unsent = True
+            p = self._goal.pose.position
+            response.message = f'Resumed: re-sending goal x={p.x:.2f} y={p.y:.2f} as #{self._seq}'
+            self._publish_status(NavGoalStatus.PENDING)
+            self._try_send()
+        self.get_logger().info(response.message)
+        return response
+
+    # Asks the server to cancel the goal it is working on, without waiting: we are
+    # inside a callback, and waiting here (spin_until_future_complete) would
+    # deadlock the executor. The answer is only logged.
+    def _cancel_active(self, reason):
+        seq = self._active_seq
+        self.get_logger().info(f'Cancelling goal #{seq} ({reason})')
+        future = self._active_handle.cancel_goal_async()
+        future.add_done_callback(
+            lambda f, seq=seq: self.get_logger().info(
+                f'Cancel of goal #{seq} answered (return_code={f.result().return_code})'))
 
     # ---- Shutdown ------------------------------------------------------------------
 

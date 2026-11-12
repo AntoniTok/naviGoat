@@ -71,7 +71,8 @@ def shared_space_graph(crossing_tags):
     """Exhibition Road in miniature: a straight pedestrian line A-M-B with a
     crossing node M halfway, and a parallel road R1-R2 joined to A and B.
 
-    Straight: 100 m + crossing penalty. Detour via the road:
+    Straight: 100 m + crossing penalty. Detour via the road, with the
+    minor road factor set to 3 (SHARED_SPACE_CONFIG; the default is 10):
     14.1 + 80 x 3 + 14.1 = 268.3 cost (108.3 m).
     """
     pedestrian = {'highway': 'pedestrian'}
@@ -84,6 +85,11 @@ def shared_space_graph(crossing_tags):
              ('A', 'R1', FOOTWAY), ('R1', 'R2', {'highway': 'unclassified'}),
              ('R2', 'B', FOOTWAY)]
     return make_graph(nodes, edges)
+
+
+# Minor road factor 3 (the default is 10), so the road detour in
+# shared_space_graph stays cheaper than an unknown major crossing.
+SHARED_SPACE_CONFIG = PlannerConfig(costs=CostConfig(minor_road_factor=3.0))
 
 
 def test_prefers_signalled_crossing():
@@ -198,14 +204,15 @@ def test_parallel_edges_usable_one_used():
 
 def test_crossing_of_no_public_road_does_not_force_detour():
     # 'none' -> minor penalty (unknown type: 40): straight costs 140 < 268.
-    result = plan(shared_space_graph({'crossed_road': 'none'}), (0, 1), (0, -101))
+    result = plan(shared_space_graph({'crossed_road': 'none'}), (0, 1), (0, -101),
+                  SHARED_SPACE_CONFIG)
     assert result.length == pytest.approx(100.0)
     assert result.crossings[0].crossed_road == 'none'
 
 
 def test_crossing_without_road_information_still_treated_as_major():
     # No label -> major (unknown type: 300): straight costs 400 > 268, so detour.
-    result = plan(shared_space_graph({}), (0, 1), (0, -101))
+    result = plan(shared_space_graph({}), (0, 1), (0, -101), SHARED_SPACE_CONFIG)
     assert result.length == pytest.approx(20 * math.sqrt(2) + 80)
 
 

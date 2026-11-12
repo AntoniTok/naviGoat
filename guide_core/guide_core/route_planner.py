@@ -14,10 +14,13 @@ from dataclasses import dataclass, field
 
 import networkx as nx
 
+from guide_core.crossings import RouteCrossing
 from guide_core.geo import latlon_to_enu
 from guide_core.polyline import simplify_polyline
 from guide_core.route import MIN_SEGMENT_LENGTH, Route
-from guide_core.walk_costs import CostConfig, classify_crossing, edge_cost, is_road
+from guide_core.walk_costs import (CostConfig, CrossingType, WalkwayClass, classify_crossing,
+                                   crosses_major_junction, edge_cost, is_island_tagged, is_road,
+                                   walkway_class)
 
 
 class PlanningError(ValueError):
@@ -46,12 +49,19 @@ class PlannerConfig:
     max_snap_distance: furthest (m) a start/goal may be from a usable graph
     node. simplify_tolerance: Douglas-Peucker tolerance (m).
     crossing_half_width: assumed half-width (m) of a crossing known only from
-    its crossing node (no mapped crossing way). costs: edge cost weights.
+    its crossing node (no mapped crossing way). junction_half_width: assumed
+    half-width (m) of a major road crossed by walking along a minor road
+    through a junction (the junction node is on the major road's centre
+    line). island_max_length: a piece of
+    walkway reachable only over crossings counts as a pedestrian island if its
+    walkways add up to at most this (m). costs: edge cost weights.
     """
 
     max_snap_distance: float = 30.0
     simplify_tolerance: float = 0.5
     crossing_half_width: float = 3.0
+    junction_half_width: float = 10.0
+    island_max_length: float = 30.0
     costs: CostConfig = field(default_factory=CostConfig)
 
     def __post_init__(self):
@@ -65,24 +75,14 @@ class PlannerConfig:
         if not _is_finite_number(self.crossing_half_width) or self.crossing_half_width <= 0.0:
             raise ValueError(f'crossing_half_width must be finite and > 0, '
                              f'got {self.crossing_half_width!r}')
+        if not _is_finite_number(self.junction_half_width) or self.junction_half_width <= 0.0:
+            raise ValueError(f'junction_half_width must be finite and > 0, '
+                             f'got {self.junction_half_width!r}')
+        if not _is_finite_number(self.island_max_length) or self.island_max_length < 0.0:
+            raise ValueError(f'island_max_length must be finite and >= 0, '
+                             f'got {self.island_max_length!r}')
         if not isinstance(self.costs, CostConfig):
             raise ValueError(f'costs must be a CostConfig, got {self.costs!r}')
-
-
-@dataclass(frozen=True)
-class RouteCrossing:
-    """One road crossing along a planned route.
-
-    start_s / end_s: distance (m) along the route of the near and far kerb.
-    crossed_road: 'major', 'minor', 'none' (no public road, e.g. a cycle
-    track) or 'unknown'.
-    """
-
-    start_s: float
-    end_s: float
-    crossing_type: object  # guide_core.walk_costs.CrossingType
-    crossed_road: str
-    tactile_paving: bool
 
 
 @dataclass(frozen=True)
@@ -131,13 +131,30 @@ class RoutePlanner:
                 raise ValueError(f'graph node {node!r} has non-finite coordinates')
             self._xy[node] = latlon_to_enu(lat, lon, *self._origin)
 
+        # Pedestrian island nodes: both ends of every footway=traffic_island
+        # edge, nodes tagged as islands (crossing:island=yes,
+        # traffic_calming=island), and small pieces of walkway reachable only
+        # over crossings (see _find_untagged_islands). Used to charge each
+        # island once and to mark crossings that touch one (has_island).
+        self._island_nodes = {node for node, data in graph.nodes(data=True)
+                              if is_island_tagged(data)}
+        for u, v, data in graph.edges(data=True):
+            if _value(data, 'footway') == 'traffic_island':
+                self._island_nodes.update((u, v))
+        self._island_nodes |= self._find_untagged_islands(graph)
+
         # Cost of each directed node pair; for parallel edges keep the cheapest
-        # usable one (and its tags). Forbidden edges get no entry at all.
+        # usable one (and its tags). Forbidden edges get no entry at all. An
+        # edge from a non-island node onto an island node pays the island
+        # penalty, so walking along an island (island to island) never does
+        # and each island is charged once per visit.
         self._cost = {}
         self._edge_tags = {}
         for u, v, data in graph.edges(data=True):
             length = math.dist(self._xy[u], self._xy[v])
-            cost = edge_cost(length, data, graph.nodes[u], graph.nodes[v], self._config.costs)
+            onto_island = v in self._island_nodes and u not in self._island_nodes
+            cost = edge_cost(length, data, graph.nodes[u], graph.nodes[v], self._config.costs,
+                             onto_island=onto_island)
             if cost is None:
                 continue
             if (u, v) not in self._cost or cost < self._cost[(u, v)]:
@@ -159,6 +176,11 @@ class RoutePlanner:
     def usable_node_count(self):
         """Number of nodes a start or goal can snap to."""
         return len(self._usable)
+
+    @property
+    def island_node_count(self):
+        """Number of pedestrian island nodes found in the graph."""
+        return len(self._island_nodes)
 
     def plan(self, start_lat, start_lon, goal_lat, goal_lon):
         """Plan a route between two lat/lon points. Returns a PlannedRoute.
@@ -183,7 +205,7 @@ class RoutePlanner:
         crossing_spans = self._find_crossings(path)
 
         # Simplify, always keeping the kerb points of mapped crossing ways, and
-        # the node itself for crossings known only from a crossing node.
+        # the node itself for crossings known only from a node.
         xy = [self._xy[node] for node in path]
         keep = set()
         for first, last, centre, *_ in crossing_spans:
@@ -213,21 +235,86 @@ class RoutePlanner:
             along.append(along[-1] + math.dist(a, b))
         total = along[-1]
 
-        half = self._config.crossing_half_width
         crossings = []
-        for first, last, centre, crossing_type, crossed_road, tactile in crossing_spans:
+        for first, last, centre, crossing_type, crossed_road, tactile, island, junction \
+                in crossing_spans:
             if centre is None:  # mapped crossing way: kerb to kerb
                 start_s, end_s = along[position[first]], along[position[last]]
-            else:  # crossing node only: assume half-width either side of it
+            else:  # crossing / junction node only: assume half-width either side of it
+                half = (self._config.junction_half_width if junction
+                        else self._config.crossing_half_width)
                 s_node = along[position[centre]]
                 start_s, end_s = max(0.0, s_node - half), min(total, s_node + half)
             crossings.append(RouteCrossing(start_s=start_s, end_s=end_s,
                                            crossing_type=crossing_type,
-                                           crossed_road=crossed_road, tactile_paving=tactile))
+                                           crossed_road=crossed_road, tactile_paving=tactile,
+                                           has_island=island))
 
         return PlannedRoute(route=route, latlons=tuple(latlons),
                             start_snap_distance=start_dist, goal_snap_distance=goal_dist,
                             crossings=tuple(crossings))
+
+    def _find_untagged_islands(self, graph):
+        """Return the nodes of pedestrian islands found from the graph's shape.
+
+        Many islands are mapped as two crossing ways joined by a short plain
+        footway, with no island tag at all (each half even says
+        crossing:island=no: no island *within* that half). Such an island is
+        literally an island in the walking graph: a small piece of walkway
+        that can only be left over crossings. Found as connected pieces of
+        walkway (footway/pedestrian/path, not crossing ways) whose lengths add
+        up to at most island_max_length, with no crossing node inside, left
+        only by crossing ways, at least two of them. A single node joining two
+        crossing ways counts too (length 0).
+        """
+        limit = self._config.island_max_length
+        # Undirected adjacency: node -> {neighbour: kind}, kind = 'crossing'
+        # (footway=crossing), 'walk' (other walkway) or 'other' (roads, steps...).
+        adjacency = {}
+        for u, v, data in graph.edges(data=True):
+            if _value(data, 'footway') == 'crossing':
+                kind = 'crossing'
+            elif walkway_class(data.get('highway')) is WalkwayClass.WALKWAY:
+                kind = 'walk'
+            else:
+                kind = 'other'
+            for a, b in ((u, v), (v, u)):
+                # If parallel edges disagree, the most restrictive kind wins.
+                previous = adjacency.setdefault(a, {}).get(b)
+                if previous is None or (previous, kind) in (('walk', 'crossing'),
+                                                            ('walk', 'other'),
+                                                            ('crossing', 'other')):
+                    adjacency[a][b] = kind
+
+        def is_crossing_node(node):
+            return _value(graph.nodes[node], 'highway') == 'crossing'
+
+        islands, checked = set(), set()
+        for start, neighbours in adjacency.items():
+            if start in checked or is_crossing_node(start) \
+                    or 'crossing' not in neighbours.values():
+                continue
+            # Collect the walkway piece around start, giving up once too long.
+            piece, stack, length, too_long = {start}, [start], 0.0, False
+            while stack and not too_long:
+                node = stack.pop()
+                for other, kind in adjacency[node].items():
+                    if kind != 'walk' or other in piece:
+                        continue
+                    piece.add(other)
+                    stack.append(other)
+                    length += math.dist(self._xy[node], self._xy[other])
+                    if length > limit:
+                        too_long = True
+                        break
+            checked |= piece
+            if too_long or any(is_crossing_node(n) for n in piece):
+                continue
+            exits = [(other, kind) for n in piece for other, kind in adjacency[n].items()
+                     if other not in piece]
+            if exits and all(kind == 'crossing' for _, kind in exits) and len(exits) >= 2:
+                islands |= piece
+        return islands
 
     def _weight(self, u, v, _data):
         """Dijkstra edge weight; None hides the edge (forbidden)."""
@@ -248,13 +335,18 @@ class RoutePlanner:
         return best_node, best_dist
 
     def _find_crossings(self, path):
-        """Return (first, last, centre, type, crossed_road, tactile) per crossing on the path.
+        """Return (first, last, centre, type, crossed_road, tactile, island, junction) per crossing.
 
-        A crossing is either a run of consecutive footway=crossing edges
-        (first/last = path indices of the near and far kerb, centre = None),
+        A crossing is either a run of consecutive footway=crossing edges, split
+        at island nodes (first/last = path indices of the near and far kerb,
+        centre = None),
         or a crossing node reached from a walkway outside any such run
         (centre = its path index; first/last = its neighbours, used only to
-        collect tags).
+        collect tags), or a junction with a major road reached along a minor
+        road (junction = True, centre = its path index; crossed road 'major',
+        type unknown: there is no crossing facility). island: a node of the
+        span is a pedestrian island node, or a crossing node or edge of the
+        span is tagged as an island.
         """
         graph = self._graph
         n_edges = len(path) - 1
@@ -269,7 +361,11 @@ class RoutePlanner:
         while i < n_edges:
             if is_crossing_edge[i]:
                 j = i
-                while j + 1 < n_edges and is_crossing_edge[j + 1]:
+                # A run of crossing edges is split at a pedestrian island node
+                # (two halves mapped as one way, or joined at one node): each
+                # half is its own crossing, so the robot stops on the island.
+                while j + 1 < n_edges and is_crossing_edge[j + 1] \
+                        and path[j + 1] not in self._island_nodes:
                     j += 1
                 spans.append((i, j + 1, None))  # edges i..j join path nodes i..j+1
                 covered.update(range(i, j + 2))
@@ -277,15 +373,24 @@ class RoutePlanner:
             else:
                 i += 1
         for k in range(1, len(path)):
+            edge = self._edge_tags[(path[k - 1], path[k])]
+            if crosses_major_junction(edge, graph.nodes[path[k]]):
+                spans.append((k - 1, min(k + 1, len(path) - 1), k, True))
+                continue
             if k in covered or _value(graph.nodes[path[k]], 'highway') != 'crossing':
                 continue
-            if is_road(self._edge_tags[(path[k - 1], path[k])].get('highway')):
+            if is_road(edge.get('highway')):
                 continue  # walking along a road through a crossing point
-            spans.append((k - 1, min(k + 1, len(path) - 1), k))
+            spans.append((k - 1, min(k + 1, len(path) - 1), k, False))
+        spans = [span if len(span) == 4 else span + (False,) for span in spans]
         spans.sort(key=lambda span: span[0])
 
         result = []
-        for first, last, centre in spans:
+        for first, last, centre, junction in spans:
+            if junction:
+                result.append((first, last, centre, CrossingType.UNKNOWN, 'major', False,
+                               False, True))
+                continue
             node_tags = [graph.nodes[path[k]] for k in range(first, last + 1)
                          if _value(graph.nodes[path[k]], 'highway') == 'crossing']
             edge_tags = [self._edge_tags[(path[k], path[k + 1])] for k in range(first, last)]
@@ -294,5 +399,8 @@ class RoutePlanner:
             crossed_road = ('major' if 'major' in roads else 'minor' if 'minor' in roads
                             else 'none' if 'none' in roads else 'unknown')
             tactile = any(_value(tags, 'tactile_paving') == 'yes' for tags in node_tags + edge_tags)
-            result.append((first, last, centre, crossing_type, crossed_road, tactile))
+            island = (any(path[k] in self._island_nodes for k in range(first, last + 1))
+                      or any(is_island_tagged(tags) for tags in edge_tags))
+            result.append((first, last, centre, crossing_type, crossed_road, tactile, island,
+                           False))
         return result

@@ -78,7 +78,7 @@ def build_graph_markers(graph, origin, frame_id, stamp):
           for node, d in graph.nodes(data=True)}
 
     # Each walkway piece is stored in both directions; draw each pair once.
-    lines = {'walkways': [], 'roads': [], 'forbidden': []}
+    lines = {'walkways': [], 'roads': [], 'forbidden': [], 'islands': []}
     seen = set()
     for u, v, data in graph.edges(data=True):
         pair = (min(u, v), max(u, v))
@@ -86,8 +86,11 @@ def build_graph_markers(graph, origin, frame_id, stamp):
             continue
         seen.add(pair)
         walk_class = walkway_class(data.get('highway'))
-        layer = ('forbidden' if walk_class is WalkwayClass.FORBIDDEN
-                 else 'walkways' if walk_class is WalkwayClass.WALKWAY else 'roads')
+        if str(data.get('footway', '')).strip().lower() == 'traffic_island':
+            layer = 'islands'  # pedestrian island between two halves of a crossing
+        else:
+            layer = ('forbidden' if walk_class is WalkwayClass.FORBIDDEN 
+                     else 'walkways' if walk_class is WalkwayClass.WALKWAY else 'roads')
         lines[layer] += [xy[u], xy[v]]
 
     dots = {t: [] for t in CrossingType}
@@ -100,6 +103,7 @@ def build_graph_markers(graph, origin, frame_id, stamp):
         ('walkways', Marker.LINE_LIST, lines['walkways'], (0.65, 0.65, 0.65, 1.0), 0.6),
         ('roads', Marker.LINE_LIST, lines['roads'], (0.35, 0.35, 0.35, 1.0), 1.0),
         ('forbidden', Marker.LINE_LIST, lines['forbidden'], (0.9, 0.1, 0.1, 1.0), 1.0),
+        ('islands', Marker.LINE_LIST, lines['islands'], (0.0, 0.8, 1.0, 1.0), 1.5),
         ('crossings_signalled', Marker.SPHERE_LIST, dots[CrossingType.SIGNALLED],
          (0.1, 0.8, 0.2, 1.0), 4.0),
         ('crossings_unsignalled', Marker.SPHERE_LIST, dots[CrossingType.UNSIGNALLED],
@@ -115,6 +119,7 @@ def build_graph_markers(graph, origin, frame_id, stamp):
         'road pieces': len(lines['roads']) // 2,
         'forbidden pieces': len(lines['forbidden']) // 2,
         'crossings': sum(len(p) for p in dots.values()),
+        'island pieces': len(lines['islands']) // 2,
     }
     return array, counts
 
@@ -136,6 +141,8 @@ class RoutePlannerNode(Node):
         self.declare_parameter('max_snap_distance', defaults.max_snap_distance)
         self.declare_parameter('simplify_tolerance', defaults.simplify_tolerance)
         self.declare_parameter('crossing_half_width', defaults.crossing_half_width)
+        self.declare_parameter('island_max_length', defaults.island_max_length)
+        self.declare_parameter('junction_half_width', defaults.junction_half_width)
         for f in fields(CostConfig):
             self.declare_parameter(f.name, getattr(defaults.costs, f.name))
         self.declare_parameter('publish_graph', True)
@@ -150,6 +157,8 @@ class RoutePlannerNode(Node):
                 max_snap_distance=self.get_parameter('max_snap_distance').value,
                 simplify_tolerance=self.get_parameter('simplify_tolerance').value,
                 crossing_half_width=self.get_parameter('crossing_half_width').value,
+                island_max_length=self.get_parameter('island_max_length').value,
+                junction_half_width=self.get_parameter('junction_half_width').value,
                 costs=costs)
         except ValueError as e:
             raise StartupError(f'Invalid planner parameter: {e}') from e
@@ -192,7 +201,12 @@ class RoutePlannerNode(Node):
         # request, _on_plan_route fills in the response, which goes back to
         # that client only. Single-threaded executor: one request at a time.
         self._service = self.create_service(PlanRoute, 'guide/plan_route', self._on_plan_route)
-        self.get_logger().info('Ready: service guide/plan_route')
+        self.get_logger().info(
+            f'Loaded {graph_file}: {graph.number_of_nodes()} nodes, '
+            f'{graph.number_of_edges()} directed edges, '
+            f'{self._planner.usable_node_count} usable nodes, '
+            f'{self._planner.island_node_count} pedestrian island nodes '
+            f'({time.perf_counter() - t0:.1f} s)')
 
     def _on_plan_route(self, request, response):
         """Plan a route; a PlanningError becomes success=false (never a crash)."""
@@ -217,11 +231,12 @@ class RoutePlannerNode(Node):
         response.crossings = [self._to_crossing_msg(c) for c in result.crossings]
 
         counts = Counter(c.crossing_type for c in result.crossings)
+        islands = sum(1 for c in result.crossings if c.has_island)
         response.message = (
             f'Route {result.length:.1f} m, {len(result.route.points)} points, '
             f'{len(result.crossings)} crossings ({counts[CrossingType.SIGNALLED]} signalled, '
             f'{counts[CrossingType.UNSIGNALLED]} unsignalled, '
-            f'{counts[CrossingType.UNKNOWN]} unknown)')
+            f'{counts[CrossingType.UNKNOWN]} unknown, {islands} with an island)')
         response.success = True
 
         self._route_pub.publish(response.path)
@@ -266,6 +281,7 @@ class RoutePlannerNode(Node):
         msg.crossing_type = CROSSING_TYPE_TO_MSG[crossing.crossing_type]
         msg.crossed_road = crossing.crossed_road
         msg.tactile_paving = bool(crossing.tactile_paving)
+        msg.has_island = bool(crossing.has_island)
         return msg
 
 

@@ -8,11 +8,23 @@ Cost model (all values in metres):
     cost = length * road factor + crossing penalty
 
 - Steps and indoor corridors are forbidden: the robot cannot use them.
-- Walking along a road centreline is discouraged: minor roads x3, major x10.
+- Walking along a road centreline is strongly discouraged (minor roads x10,
+  major x50) but never forbidden: some places can only be reached that way.
+  The robot's goals would then lie on the road's centre line.
+- Walking along a minor road through a junction with a major road (node
+  attribute junction_major=yes, added by fetch_osm_graph) is crossing that
+  major road without any crossing facility: charged as an unknown crossing
+  of a major road, and the route planner reports it as a crossing.
 - A crossing is charged once, on the walkway edge that steps onto the
   crossing node, with a penalty that depends on the crossing type and on the
   class of road crossed (node attribute 'crossed_road', added by
   fetch_osm_graph; missing means unknown and is treated as major).
+- A pedestrian island (two-stage crossing) costs island_penalty extra,
+  charged once per island: on the edge that steps onto an island node (the
+  route planner decides which nodes are island nodes and passes
+  onto_island=True), or on a crossing way tagged crossing:island=yes where its
+  crossing is charged. Islands are discouraged, not forbidden: the robot can
+  only stop on a narrow island as precisely as its localisation allows.
 """
 
 import enum
@@ -87,6 +99,21 @@ def is_road(highway):
     return value in MAJOR_ROADS or value in MINOR_ROADS
 
 
+def is_major_junction(node_tags):
+    """Return True if a node is a junction with a major road (junction_major=yes)."""
+    return _tag(node_tags, 'junction_major') == 'yes'
+
+
+def crosses_major_junction(edge_tags, to_tags):
+    """Return True if walking this edge means crossing a major road at a junction.
+
+    That is: walking along a minor road (not a major one, which already pays
+    its own factor and does not cross itself) onto a junction_major node.
+    """
+    return (_norm(_tag(edge_tags, 'highway')) in MINOR_ROADS
+            and is_major_junction(to_tags))
+
+
 def classify_crossing(*tag_dicts):
     """Classify a crossing from one or more tag dictionaries (node, way).
 
@@ -120,14 +147,15 @@ class CostConfig:
     cost). Penalties must be finite and >= 0, as Dijkstra requires.
     """
 
-    minor_road_factor: float = 3.0
-    major_road_factor: float = 10.0
+    minor_road_factor: float = 10.0
+    major_road_factor: float = 50.0
     signalled_minor: float = 10.0
     unsignalled_minor: float = 30.0
     unknown_minor: float = 40.0
     signalled_major: float = 20.0
     unsignalled_major: float = 300.0
     unknown_major: float = 300.0
+    island_penalty: float = 50.0
 
     def __post_init__(self):
         """Validate all values."""
@@ -157,11 +185,23 @@ def crossing_penalty(crossing_type, crossed_road, config):
     return config.unknown_minor if minor else config.unknown_major
 
 
-def edge_cost(length, edge_tags, from_tags, to_tags, config=None):
+def is_island_tagged(tags):
+    """Return True if node or way tags mark a pedestrian island.
+
+    crossing:island=yes (on a crossing node or way) or traffic_calming=island
+    (on a node). footway=traffic_island ways are found by the route planner,
+    which looks at the graph around a node.
+    """
+    return _tag(tags, 'crossing:island') == 'yes' or _tag(tags, 'traffic_calming') == 'island'
+
+
+def edge_cost(length, edge_tags, from_tags, to_tags, config=None, onto_island=False):
     """Return the cost of walking one directed edge, or None if forbidden.
 
     length: edge length in metres. edge_tags: the edge's (way's) tags.
     from_tags / to_tags: tags of the start / end node (may be None).
+    onto_island: True if this edge steps from outside a pedestrian island onto
+    it (decided by the caller). Adds island_penalty once; never on roads.
     """
     if config is None:
         config = CostConfig()
@@ -180,14 +220,22 @@ def edge_cost(length, edge_tags, from_tags, to_tags, config=None):
     }[walk_class]
     cost = length * factor
 
-    # Walking along a road through a crossing point is not crossing that road.
+    # Walking along a road through a crossing point is not crossing that road,
+    # but walking a minor road into a junction with a major road crosses it.
     if is_road(highway):
+        if crosses_major_junction(edge_tags, to_tags):
+            cost += crossing_penalty(CrossingType.UNKNOWN, 'major', config)
         return cost
+    island = onto_island
     # Stepping onto a crossing node: charge the crossing once, here.
     if _tag(to_tags, 'highway') == 'crossing':
         crossing_type = classify_crossing(to_tags, edge_tags)
-        return cost + crossing_penalty(crossing_type, _tag(to_tags, 'crossed_road'), config)
+        cost += crossing_penalty(crossing_type, _tag(to_tags, 'crossed_road'), config)
+        island = island or is_island_tagged(edge_tags)
     # Fallback: a crossing way with no crossing node at either end.
-    if _tag(edge_tags, 'footway') == 'crossing' and _tag(from_tags, 'highway') != 'crossing':
-        return cost + crossing_penalty(classify_crossing(edge_tags), None, config)
+    elif _tag(edge_tags, 'footway') == 'crossing' and _tag(from_tags, 'highway') != 'crossing':
+        cost += crossing_penalty(classify_crossing(edge_tags), None, config)
+        island = island or is_island_tagged(edge_tags)
+    if island:
+        cost += config.island_penalty
     return cost

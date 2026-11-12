@@ -24,3 +24,21 @@ float64 cross_track_error
 
 # True once the robot has reached the end of the route. Stays true until a new route is loaded.
 bool arrived
+
+# --- Road crossings (all false / -1 / 0.0 on a route without crossings) ---
+
+# True while the robot is stopped before the next crossing, waiting for the
+# user's go (guide/confirm_crossing). Only the user releases a crossing.
+bool waiting_at_crossing
+
+# True while the robot is between the near and far kerb of a crossing the
+# user has confirmed.
+bool on_crossing
+
+# Index (0-based, in route order) of the first crossing not yet confirmed,
+# or -1 if no crossings are left.
+int32 next_crossing_index
+
+# That crossing's near kerb (start_s) minus the robot's distance_along.
+# Negative once the robot is past the near kerb; 0.0 if no crossings are left.
+float64 distance_to_next_crossing

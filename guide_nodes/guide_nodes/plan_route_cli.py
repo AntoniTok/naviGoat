@@ -20,11 +20,24 @@ from rclpy.utilities import remove_ros_args
 from guide_interfaces.msg import RouteCrossing
 from guide_interfaces.srv import PlanRoute
 
+from guide_core.crossings import (RouteCrossing as CoreCrossing, crossings_from_dict,
+                                  crossings_to_dicts, prepare_crossings)
+from guide_core.route import InvalidRouteError, Route, route_from_dict
+from guide_core.walk_costs import CrossingType
+
 # RouteCrossing.msg's uint8 constants -> readable names.
 TYPE_NAMES = {
     RouteCrossing.SIGNALLED: 'signalled',
     RouteCrossing.UNSIGNALLED: 'unsignalled',
     RouteCrossing.UNKNOWN: 'unknown',
+}
+
+# RouteCrossing.msg's uint8 constants -> guide_core's CrossingType, so the
+# crossings can be written with guide_core's route-file helpers.
+MSG_TO_CROSSING_TYPE = {
+    RouteCrossing.SIGNALLED: CrossingType.SIGNALLED,
+    RouteCrossing.UNSIGNALLED: CrossingType.UNSIGNALLED,
+    RouteCrossing.UNKNOWN: CrossingType.UNKNOWN,
 }
 
 
@@ -43,23 +56,41 @@ def parse_args(argv):
 
 
 def save_route_yaml(path, response):
-    """Write the route in the follower's format: {frame_id, waypoints: [[x, y], ...]}.
+    """Write the route in the follower's format: {frame_id, waypoints, crossings}.
 
-    Crossings are written as comments for now (the route format gains a
-    crossings key in Step 8b).
+    The file is read back with the same guide_core functions the route
+    follower uses, so a file the follower cannot load is reported here.
+    Returns (number of waypoints, number of crossings).
     """
     waypoints = [[round(p.pose.position.x, 3), round(p.pose.position.y, 3)]
                  for p in response.path.poses]
+    # Rebuild the route from the rounded points, exactly as the follower
+    # will. Its length can differ from the planner's by rounding (mm), so
+    # crossing ends are clamped to it.
+    route = Route(waypoints)
+    crossings = [CoreCrossing(start_s=max(0.0, c.start_s),
+                              end_s=min(route.total_length, c.end_s),
+                              crossing_type=MSG_TO_CROSSING_TYPE[c.crossing_type],
+                              crossed_road=c.crossed_road,
+                              tactile_paving=c.tactile_paving,
+                              has_island=c.has_island)
+                 for c in response.crossings]
+    data = {'frame_id': response.path.header.frame_id,
+            'waypoints': waypoints,
+            'crossings': crossings_to_dicts(prepare_crossings(crossings, route.total_length))}
     header = ['# Planned by route_planner (guide/plan_route).',
-              f'# {response.message}',
-              '# Crossings (distance along route, m), informational until Step 8b:']
-    header += [f'#   {c.start_s:.1f} .. {c.end_s:.1f}: {TYPE_NAMES[c.crossing_type]}, '
-               f'{c.crossed_road} road' for c in response.crossings] or ['#   none']
-    body = yaml.safe_dump({'frame_id': response.path.header.frame_id, 'waypoints': waypoints},
-                          default_flow_style=None, sort_keys=False)
+              f'# {response.message}']
+    # default_flow_style=None writes each waypoint and each crossing on one
+    # line; sort_keys=False keeps the keys in the order above.
+    body = yaml.safe_dump(data, default_flow_style=None, sort_keys=False, width=120)
     with open(path, 'w', encoding='utf-8') as f:
         f.write('\n'.join(header) + '\n' + body)
-    return len(waypoints)
+
+    # Read it back the way the route follower will.
+    with open(path, encoding='utf-8') as f:
+        loaded = yaml.safe_load(f)
+    loaded_route = route_from_dict(loaded)
+    return len(waypoints), len(crossings_from_dict(loaded, loaded_route))
 
 
 def main(argv=None):
@@ -99,7 +130,7 @@ def main(argv=None):
         for c in response.crossings:
             print(f'  crossing at s = {c.start_s:.1f} .. {c.end_s:.1f} m: '
                   f'{TYPE_NAMES[c.crossing_type]}, {c.crossed_road} road, '
-                  f'tactile paving: {c.tactile_paving}')
+                  f'tactile paving: {c.tactile_paving}, island: {c.has_island}')
         first, last = response.path.poses[0].pose.position, response.path.poses[-1].pose.position
         print(f'Map frame: starts at ({first.x:.1f}, {first.y:.1f}) m, '
               f'ends at ({last.x:.1f}, {last.y:.1f}) m')
@@ -111,8 +142,14 @@ def main(argv=None):
               f'start_yaw_deg:={yaw_deg:.1f}')
         if args.save:
             path = os.path.abspath(os.path.expanduser(args.save))
-            count = save_route_yaml(path, response)
-            print(f'Saved {count} waypoints to {path}')
+            try:
+                count, crossing_count = save_route_yaml(path, response)
+            except (InvalidRouteError, OSError) as error:
+                # InvalidRouteError: the file would not load in the follower
+                # (CrossingError is a subclass). OSError: could not write it.
+                print(f'Could not save a valid route file: {error}', file=sys.stderr)
+                return 1
+            print(f'Saved {count} waypoints and {crossing_count} crossings to {path}')
         return 0
     finally:
         node.destroy_node()

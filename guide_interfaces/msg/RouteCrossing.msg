@@ -8,3 +8,4 @@ float64 end_s            # distance along the route (m) of the far kerb
 uint8 crossing_type      # SIGNALLED, UNSIGNALLED or UNKNOWN
 string crossed_road      # 'major', 'minor', 'none' (no public road, e.g. cycle track) or 'unknown'
 bool tactile_paving
+bool has_island          # part of a two-stage crossing with a pedestrian island
