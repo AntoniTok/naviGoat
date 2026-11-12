@@ -1,16 +1,18 @@
 """Command-line client for the guide/plan_route service.
 
-Plans a route, prints a summary and can save it as a route YAML that the
-route follower loads (route_file parameter).
+Plans a route, prints a summary, can save it as a route YAML that the
+route follower loads (route_file parameter) and can send it straight to a
+running route follower (guide/set_route), as the mission manager does.
 
 Usage:
   ros2 run guide_nodes plan_route START_LAT START_LON GOAL_LAT GOAL_LON [--save FILE]
+      [--send [--route-id N]]
 """
 
 import argparse
+import math
 import os
 import sys
-import math
 
 import rclpy
 import yaml
@@ -18,7 +20,7 @@ from rclpy.node import Node
 from rclpy.utilities import remove_ros_args
 
 from guide_interfaces.msg import RouteCrossing
-from guide_interfaces.srv import PlanRoute
+from guide_interfaces.srv import PlanRoute, SetRoute
 
 from guide_core.crossings import (RouteCrossing as CoreCrossing, crossings_from_dict,
                                   crossings_to_dicts, prepare_crossings)
@@ -52,6 +54,10 @@ def parse_args(argv):
                         help='save the route as a route YAML for the route follower')
     parser.add_argument('--timeout', type=float, default=10.0,
                         help='seconds to wait for the service and for the answer (default 10)')
+    parser.add_argument('--send', action='store_true',
+                        help='also send the route to the route follower (guide/set_route)')
+    parser.add_argument('--route-id', type=int, default=1,
+                        help='route id for --send (> 0, default 1)')
     return parser.parse_args(argv)
 
 
@@ -93,6 +99,28 @@ def save_route_yaml(path, response):
     return len(waypoints), len(crossings_from_dict(loaded, loaded_route))
 
 
+def send_route(node, response, route_id, timeout):
+    """Hand the route to the follower (guide/set_route); return 0 if accepted, else 1.
+
+    Sends the planner's path and crossings unchanged, exactly as the mission
+    manager will.
+    """
+    client = node.create_client(SetRoute, 'guide/set_route')
+    if not client.wait_for_service(timeout_sec=timeout):
+        print('Service guide/set_route not available. Is route_follower running?',
+              file=sys.stderr)
+        return 1
+    future = client.call_async(SetRoute.Request(
+        route_id=route_id, path=response.path, crossings=response.crossings))
+    rclpy.spin_until_future_complete(node, future, timeout_sec=timeout)
+    if not future.done():
+        print('No answer from guide/set_route.', file=sys.stderr)
+        return 1
+    answer = future.result()
+    print(f"Sent to follower: {'OK' if answer.success else 'REJECTED'}: {answer.message}")
+    return 0 if answer.success else 1
+
+
 def main(argv=None):
     """Call the service once; return 0 on success, 1 on any failure."""
     argv = sys.argv if argv is None else argv
@@ -125,6 +153,11 @@ def main(argv=None):
             print(f'FAILED: {response.message}')
             return 1
         print(response.message)
+        # The same warnings as at the end of the message, but from the
+        # separate warnings field that programs (the mission manager) read.
+        print(f'Warnings field: {len(response.warnings)} item(s)')
+        for i, warning in enumerate(response.warnings, start=1):
+            print(f'  {i}. {warning}')
         print(f'Snapped: start {response.start_snap_distance:.1f} m, '
               f'goal {response.goal_snap_distance:.1f} m from the requested points')
         for c in response.crossings:
@@ -134,6 +167,16 @@ def main(argv=None):
         first, last = response.path.poses[0].pose.position, response.path.poses[-1].pose.position
         print(f'Map frame: starts at ({first.x:.1f}, {first.y:.1f}) m, '
               f'ends at ({last.x:.1f}, {last.y:.1f}) m')
+
+        # Path check: rebuild a Route from the UNROUNDED path points, as the
+        # route follower does for a route received at runtime. If its length
+        # matches the planner's, the crossings' s values line up with it.
+        path_route = Route([(p.pose.position.x, p.pose.position.y)
+                            for p in response.path.poses])
+        difference_mm = (path_route.total_length - response.length) * 1000.0
+        print(f'Path check: route rebuilt from the path is {path_route.total_length:.3f} m '
+              f'(planner {response.length:.3f} m, difference {difference_mm:.3f} mm)')
+
         # Ready-made sim launch arguments: first route point, facing along the
         # first segment (the route always has at least 2 points).
         p0, p1 = response.path.poses[0].pose.position, response.path.poses[1].pose.position
@@ -150,6 +193,8 @@ def main(argv=None):
                 print(f'Could not save a valid route file: {error}', file=sys.stderr)
                 return 1
             print(f'Saved {count} waypoints and {crossing_count} crossings to {path}')
+        if args.send:
+            return send_route(node, response, args.route_id, args.timeout)
         return 0
     finally:
         node.destroy_node()

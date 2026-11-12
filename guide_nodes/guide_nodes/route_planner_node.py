@@ -89,7 +89,7 @@ def build_graph_markers(graph, origin, frame_id, stamp):
         if str(data.get('footway', '')).strip().lower() == 'traffic_island':
             layer = 'islands'  # pedestrian island between two halves of a crossing
         else:
-            layer = ('forbidden' if walk_class is WalkwayClass.FORBIDDEN 
+            layer = ('forbidden' if walk_class is WalkwayClass.FORBIDDEN
                      else 'walkways' if walk_class is WalkwayClass.WALKWAY else 'roads')
         lines[layer] += [xy[u], xy[v]]
 
@@ -185,11 +185,6 @@ class RoutePlannerNode(Node):
             self._planner = RoutePlanner(graph, *origin, config)
         except ValueError as e:
             raise StartupError(f'Graph in {graph_file!r} is unusable: {e}') from e
-        self.get_logger().info(
-            f'Loaded {graph_file}: {graph.number_of_nodes()} nodes, '
-            f'{graph.number_of_edges()} directed edges, '
-            f'{self._planner.usable_node_count} usable nodes '
-            f'({time.perf_counter() - t0:.1f} s)')
 
         # --- Publishers (latched, see LATCHED_QOS) ---
         # guide/planned_route: the most recent successful plan, for RViz.
@@ -209,6 +204,7 @@ class RoutePlannerNode(Node):
         # request, _on_plan_route fills in the response, which goes back to
         # that client only. Single-threaded executor: one request at a time.
         self._service = self.create_service(PlanRoute, 'guide/plan_route', self._on_plan_route)
+        # One startup summary, logged once the service is up (time includes the RViz markers).
         self.get_logger().info(
             f'Loaded {graph_file}: {graph.number_of_nodes()} nodes, '
             f'{graph.number_of_edges()} directed edges, '
@@ -230,6 +226,9 @@ class RoutePlannerNode(Node):
             return response
 
         stamp = self.get_clock().now().to_msg()
+        # The Path holds exactly result.route's points (no rounding or
+        # re-simplifying), so crossing s values measured along result.route
+        # stay valid for anyone who rebuilds a Route from this Path.
         response.path = self._to_path(result.route, stamp)
         response.latitudes = [lat for lat, _ in result.latlons]
         response.longitudes = [lon for _, lon in result.latlons]
@@ -245,9 +244,11 @@ class RoutePlannerNode(Node):
             f'{len(result.crossings)} crossings ({counts[CrossingType.SIGNALLED]} signalled, '
             f'{counts[CrossingType.UNSIGNALLED]} unsignalled, '
             f'{counts[CrossingType.UNKNOWN]} unknown, {islands} with an island)')
-        # Reasons to doubt the route (goal snapped to a road, long detour) go
-        # at the end of the message, so the CLI and later the mission manager
-        # show them; the route is still returned.
+        # Reasons to doubt the route (goal snapped to a road, long detour,
+        # tunnel) are returned two ways; the route is still returned:
+        # - response.warnings: one string per warning, for programs (mission manager);
+        # - appended to the message as " WARNING: ...", for people (CLI, logs, saved files).
+        response.warnings = list(result.warnings)
         for warning in result.warnings:
             response.message += f' WARNING: {warning}.'
         if result.warnings:
@@ -255,10 +256,11 @@ class RoutePlannerNode(Node):
         response.success = True
 
         self._route_pub.publish(response.path)
+        # Timing and snaps first, so nothing is glued after the message's own punctuation.
         self.get_logger().info(
-            f'{response.message}; snapped {result.start_snap_distance:.1f} m / '
-            f'{result.goal_snap_distance:.1f} m; planned in '
-            f'{(time.perf_counter() - t0) * 1000:.0f} ms')
+            f'Planned in {(time.perf_counter() - t0) * 1000:.0f} ms '
+            f'(snapped {result.start_snap_distance:.1f} m / '
+            f'{result.goal_snap_distance:.1f} m): {response.message}')
         return response
 
     def _to_path(self, route, stamp):

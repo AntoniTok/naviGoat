@@ -12,9 +12,18 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
-        # Install route files into share/guide_bringup/routes.
+        # Data files installed into share/guide_bringup/<folder>, where launch
+        # files find them with FindPackageShare. glob() runs at BUILD time: a
+        # file added later is only installed after the next colcon build.
         (os.path.join('share', package_name, 'routes'), glob('routes/*.yaml')),
         (os.path.join('share', package_name, 'launch'), glob('launch/*.launch.py')),
+        # Step 7: curated destinations (mission manager), the cached OSM walk
+        # graph (route planner; the .graphml is gitignored, re-fetch it with
+        # fetch_osm_graph on a new machine) and the RViz configurations.
+        (os.path.join('share', package_name, 'destinations'), glob('destinations/*.yaml')),
+        (os.path.join('share', package_name, 'osm'),
+            glob('osm/*.graphml') + glob('osm/*.meta.yaml')),
+        (os.path.join('share', package_name, 'rviz'), glob('rviz/*.rviz')),
     ],
     install_requires=['setuptools'],
     zip_safe=True,

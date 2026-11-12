@@ -5,6 +5,11 @@
 # stamp = stamp of the pose this was computed from; frame_id = "map"
 std_msgs/Header header
 
+# Which route this refers to: the route_id given to guide/set_route,
+# or 0 for a route loaded from the route_file parameter at startup.
+# Lets listeners ignore messages left over from a previous route.
+uint32 route_id
+
 # Index of the route segment the robot is projected onto (0 = first leg).
 uint32 segment_index
 

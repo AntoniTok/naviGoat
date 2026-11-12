@@ -13,6 +13,8 @@
   <depend>std_msgs</depend>
   <depend>geometry_msgs</depend>
   <depend>nav_msgs</depend>
+  <!-- Needed by NavigateTo.action: every action uses action_msgs for goal ids and status -->
+  <depend>action_msgs</depend>
 
   <exec_depend>rosidl_default_runtime</exec_depend>
 

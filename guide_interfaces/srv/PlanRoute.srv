@@ -10,6 +10,7 @@ float64 goal_longitude
 # Response
 bool success                 # false = no route; message says why
 string message               # human-readable summary or reason for failure
+string[] warnings            # each warning on its own (also appended to message as " WARNING: ...")
 nav_msgs/Path path           # simplified route in the map frame (metres)
 float64[] latitudes          # lat of each path point (same order as path.poses)
 float64[] longitudes         # lon of each path point
