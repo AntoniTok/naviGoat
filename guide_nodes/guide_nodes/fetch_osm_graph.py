@@ -18,7 +18,7 @@ import osmnx as ox
 import yaml
 # Road types (major/minor) shared with the planner's cost model, so crossing
 # labels and costs always agree.
-from guide_core.walk_costs import MAJOR_ROADS, MINOR_ROADS, is_road
+   from guide_core.walk_costs import MAJOR_ROADS, MINOR_ROADS, is_minor_service, is_road
 
 # Same origin as the localizer: the centre of the local east-north (map) frame.
 DEFAULT_ORIGIN_LAT = 51.4988
@@ -133,30 +133,37 @@ def annotate_crossed_roads(walk, roads):
         counts[data['crossed_road']] += 1
     return counts
 
-def annotate_major_junctions(walk, roads):
-    """Mark walk-graph nodes where a major road meets other roads.
+def annotate_junctions(walk, roads):
+    """Label walk-graph nodes where roads meet with the road directions of each class.
 
-    Walking along a minor road through such a node means crossing the major
-    road with no crossing facility; the planner charges and reports it. A
-    junction needs at least 3 road directions, so an ordinary point along a
-    major road is not one. Directions are counted from both graphs: the road
-    graph knows roads the walk graph dropped (e.g. Cromwell Road, whose
-    pavements are mapped separately), the walk graph knows streets closed to
-    cars (e.g. a shared street). Sets junction_major='yes'; returns the count.
+    Walking along a road through a junction crosses the other road(s) there,
+    usually with no crossing facility; the planner charges and reports it
+    (guide_core.walk_costs.crossed_road_at_junction). Directions are counted
+    from both graphs: the road graph knows roads the walk graph dropped (e.g.
+    Cromwell Road, whose pavements are mapped separately), the walk graph
+    knows streets closed to cars (e.g. a shared street). Sets
+    junction_major_dirs / junction_minor_dirs (as text, GraphML stores text)
+    where at least 3 road directions meet; returns the number of junctions.
     """
     count = 0
     for node, data in walk.nodes(data=True):
-        neighbours, types = set(), set()
+        classes = {}  # neighbour node -> 'major' or 'minor' (major wins)
         for graph in (walk, roads):
             if node not in graph:
                 continue
             for u, v, edge in list(graph.in_edges(node, data=True)) + \
                     list(graph.out_edges(node, data=True)):
-                if is_road(edge.get('highway')):
-                    neighbours.add(v if u == node else u)
-                    types.add(str(edge.get('highway')))
-        if len(neighbours) >= 3 and types & MAJOR_ROADS:
-            data['junction_major'] = 'yes'
+                highway = edge.get('highway')
+                # Driveways and car-park lanes don't make a junction a crossing.
+                if not is_road(highway) or is_minor_service(edge):
+                    continue
+                other = v if u == node else u
+                if classes.get(other) != 'major':
+                    classes[other] = 'major' if str(highway) in MAJOR_ROADS else 'minor'
+        if len(classes) >= 3:
+            values = list(classes.values())
+            data['junction_major_dirs'] = str(values.count('major'))
+            data['junction_minor_dirs'] = str(values.count('minor'))
             count += 1
     return count
 
@@ -214,7 +221,7 @@ def main(argv=None):
                                   dist=args.dist, network_type='drive_service',
                                   simplify=False, retain_all=True)
     crossed_counts = annotate_crossed_roads(graph, roads)
-    junction_count = annotate_major_junctions(graph, roads)
+    junction_count = annotate_junctions(graph, roads)
 
     ox.save_graphml(graph, filepath=out_path)
 
@@ -232,7 +239,7 @@ def main(argv=None):
         'nodes': graph.number_of_nodes(),
         'directed_edges': graph.number_of_edges(),
         'crossing_nodes_by_road_crossed': dict(crossed_counts),
-        'major_road_junctions': junction_count,
+        'road_junctions': junction_count,
         'attribution': '(c) OpenStreetMap contributors, ODbL',
     }
     with open(meta_path, 'w', encoding='utf-8') as f:
@@ -245,7 +252,7 @@ def main(argv=None):
         print(line)
         
     print(f'Crossing nodes by road crossed: {dict(crossed_counts.most_common())}')
-    print(f'Junctions with a major road (junction_major=yes): {junction_count}')
+    print(f'Road junctions labelled (junction_*_dirs): {junction_count}')
         
 
 if __name__ == '__main__':

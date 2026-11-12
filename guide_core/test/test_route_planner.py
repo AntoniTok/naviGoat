@@ -140,8 +140,9 @@ def test_snap_distances_reported():
 
 
 def test_start_too_far_from_walkway_rejected():
-    with pytest.raises(PlanningError, match='start is 50.0 m'):
-        plan(road_graph(), (0, 60), (0, -12))
+    # 80 m from the nearest walkway (limit 60) and from any node (limit 30).
+    with pytest.raises(PlanningError, match='start is 80.0 m'):
+        plan(road_graph(), (0, 90), (0, -12))
 
 
 def test_same_start_and_goal_node_rejected():

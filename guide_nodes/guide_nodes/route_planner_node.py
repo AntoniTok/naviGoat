@@ -139,10 +139,14 @@ class RoutePlannerNode(Node):
         self.declare_parameter('origin_lon', -0.1749)
         self.declare_parameter('map_frame', 'map')
         self.declare_parameter('max_snap_distance', defaults.max_snap_distance)
+        self.declare_parameter('walkway_snap_distance', defaults.walkway_snap_distance)
+        self.declare_parameter('goal_snap_slack', defaults.goal_snap_slack)
+        self.declare_parameter('goal_snap_weight', defaults.goal_snap_weight)
         self.declare_parameter('simplify_tolerance', defaults.simplify_tolerance)
         self.declare_parameter('crossing_half_width', defaults.crossing_half_width)
         self.declare_parameter('island_max_length', defaults.island_max_length)
         self.declare_parameter('junction_half_width', defaults.junction_half_width)
+        self.declare_parameter('side_street_half_width', defaults.side_street_half_width)
         for f in fields(CostConfig):
             self.declare_parameter(f.name, getattr(defaults.costs, f.name))
         self.declare_parameter('publish_graph', True)
@@ -159,6 +163,10 @@ class RoutePlannerNode(Node):
                 crossing_half_width=self.get_parameter('crossing_half_width').value,
                 island_max_length=self.get_parameter('island_max_length').value,
                 junction_half_width=self.get_parameter('junction_half_width').value,
+                walkway_snap_distance=self.get_parameter('walkway_snap_distance').value,
+                side_street_half_width=self.get_parameter('side_street_half_width').value,
+                goal_snap_slack=self.get_parameter('goal_snap_slack').value,
+                goal_snap_weight=self.get_parameter('goal_snap_weight').value,
                 costs=costs)
         except ValueError as e:
             raise StartupError(f'Invalid planner parameter: {e}') from e
@@ -237,6 +245,13 @@ class RoutePlannerNode(Node):
             f'{len(result.crossings)} crossings ({counts[CrossingType.SIGNALLED]} signalled, '
             f'{counts[CrossingType.UNSIGNALLED]} unsignalled, '
             f'{counts[CrossingType.UNKNOWN]} unknown, {islands} with an island)')
+        # Reasons to doubt the route (goal snapped to a road, long detour) go
+        # at the end of the message, so the CLI and later the mission manager
+        # show them; the route is still returned.
+        for warning in result.warnings:
+            response.message += f' WARNING: {warning}.'
+        if result.warnings:
+            self.get_logger().warning('; '.join(result.warnings))
         response.success = True
 
         self._route_pub.publish(response.path)

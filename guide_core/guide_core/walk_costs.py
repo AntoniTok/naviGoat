@@ -11,10 +11,25 @@ Cost model (all values in metres):
 - Walking along a road centreline is strongly discouraged (minor roads x10,
   major x50) but never forbidden: some places can only be reached that way.
   The robot's goals would then lie on the road's centre line.
-- Walking along a minor road through a junction with a major road (node
-  attribute junction_major=yes, added by fetch_osm_graph) is crossing that
-  major road without any crossing facility: charged as an unknown crossing
-  of a major road, and the route planner reports it as a crossing.
+- Tunnels (tunnel=yes) cost tunnel_factor (x3) on top: there is no GPS
+  underground, so a tunnel is used only when it clearly saves walking or
+  crossings. Short building passages (tunnel=building_passage) are not
+  affected.
+- Service roads (highway=service: campus and access roads, car-park lanes,
+  driveways; few, slow cars) cost service_road_factor (x3) instead of the
+  minor road factor.
+- A road whose pavement is tagged on it (sidewalk=both/left/right/yes) is
+  walked on that pavement: sidewalk_road_factor (x1.5) instead of the road
+  factor. sidewalk=separate/no or no tag keeps the road factor.
+- Walking along a road into a junction (node attributes junction_major_dirs /
+  junction_minor_dirs, added by fetch_osm_graph) crosses the other road(s)
+  meeting there with no crossing facility: charged as an unknown crossing of
+  the most important other road (see crossed_road_at_junction), and the
+  route planner reports it as a crossing. Turning off a major road onto a
+  minor one also crosses the major road (the pavement may be on the far
+  side): a minor-road edge leaving a junction where a major road meets is
+  charged as a major crossing too (crossed_road_leaving_junction). Going
+  straight across along a minor road is therefore charged twice.
 - A crossing is charged once, on the walkway edge that steps onto the
   crossing node, with a penalty that depends on the crossing type and on the
   class of road crossed (node attribute 'crossed_road', added by
@@ -99,19 +114,77 @@ def is_road(highway):
     return value in MAJOR_ROADS or value in MINOR_ROADS
 
 
-def is_major_junction(node_tags):
-    """Return True if a node is a junction with a major road (junction_major=yes)."""
-    return _tag(node_tags, 'junction_major') == 'yes'
+def is_tunnel(edge_tags):
+    """Return True for an underground way (tunnel=yes; not a building passage)."""
+    return _tag(edge_tags, 'tunnel') == 'yes'
 
 
-def crosses_major_junction(edge_tags, to_tags):
-    """Return True if walking this edge means crossing a major road at a junction.
+SIDEWALK_VALUES = frozenset({'both', 'left', 'right', 'yes'})
+# service=* values of ways too minor to count at junctions: crossing a
+# driveway or a car-park lane is not a crossing stop.
+MINOR_SERVICE_VALUES = frozenset({'driveway', 'parking_aisle', 'drive-through'})
 
-    That is: walking along a minor road (not a major one, which already pays
-    its own factor and does not cross itself) onto a junction_major node.
+
+def is_minor_service(edge_tags):
+    """Return True for a driveway, car-park lane or drive-through (highway=service)."""
+    return (_tag(edge_tags, 'highway') == 'service'
+            and _tag(edge_tags, 'service') in MINOR_SERVICE_VALUES)
+
+
+def has_sidewalk(edge_tags):
+    """Return True if a road's pavement is tagged on the road itself.
+
+    sidewalk=separate (pavement mapped as its own footway, which should be
+    used instead) and sidewalk=no count as no pavement here.
     """
-    return (_norm(_tag(edge_tags, 'highway')) in MINOR_ROADS
-            and is_major_junction(to_tags))
+    return _tag(edge_tags, 'sidewalk') in SIDEWALK_VALUES
+
+
+def _count(tags, key):
+    """Return tags[key] as a non-negative int (GraphML stores it as text), else 0."""
+    try:
+        return max(0, int(float(_tag(tags, key) or 0)))
+    except ValueError:
+        return 0
+
+
+def crossed_road_leaving_junction(edge_tags, from_tags):
+    """Return 'major' if walking this minor-road edge leaves a junction with a major road.
+
+    Covers turning off a major road into a side street: with the pavement
+    only tagged on the road, the robot may be on the far side and must cross
+    the major road. Returns None otherwise.
+    """
+    highway = _norm(_tag(edge_tags, 'highway'))
+    if highway in MINOR_ROADS and _count(from_tags, 'junction_major_dirs') >= 1:
+        return 'major'
+    return None
+
+
+def crossed_road_at_junction(edge_tags, to_tags):
+    """Return the class of road crossed by walking this road edge into a junction.
+
+    to_tags carries junction_major_dirs / junction_minor_dirs: how many road
+    directions of each class meet at the node (the walked road counts too,
+    usually 2). Returns 'major', 'minor' or None (no other road meets, or the
+    edge is not a road). The most important other road wins:
+    walking a minor road: a major road meets (any major direction) -> 'major';
+    else another minor road (3+ minor directions) -> 'minor'.
+    walking a major road: another major road (3+ major directions) -> 'major';
+    else a minor road meets -> 'minor'.
+    """
+    highway = _norm(_tag(edge_tags, 'highway'))
+    if not is_road(highway):
+        return None
+    major = _count(to_tags, 'junction_major_dirs')
+    minor = _count(to_tags, 'junction_minor_dirs')
+    if highway in MAJOR_ROADS:
+        if major >= 3:
+            return 'major'
+        return 'minor' if minor >= 1 else None
+    if major >= 1:
+        return 'major'
+    return 'minor' if minor >= 3 else None
 
 
 def classify_crossing(*tag_dicts):
@@ -156,6 +229,9 @@ class CostConfig:
     unsignalled_major: float = 300.0
     unknown_major: float = 300.0
     island_penalty: float = 50.0
+    tunnel_factor: float = 3.0
+    sidewalk_road_factor: float = 1.5
+    service_road_factor: float = 3.0
 
     def __post_init__(self):
         """Validate all values."""
@@ -218,13 +294,22 @@ def edge_cost(length, edge_tags, from_tags, to_tags, config=None, onto_island=Fa
         WalkwayClass.MINOR_ROAD: config.minor_road_factor,
         WalkwayClass.MAJOR_ROAD: config.major_road_factor,
     }[walk_class]
+    if walk_class is not WalkwayClass.WALKWAY:
+        if has_sidewalk(edge_tags):
+            factor = config.sidewalk_road_factor
+        elif highway == 'service':
+            factor = config.service_road_factor
+    if is_tunnel(edge_tags):
+        factor *= config.tunnel_factor
     cost = length * factor
 
     # Walking along a road through a crossing point is not crossing that road,
-    # but walking a minor road into a junction with a major road crosses it.
+    # but walking it into a junction crosses the other road(s) meeting there.
     if is_road(highway):
-        if crosses_major_junction(edge_tags, to_tags):
-            cost += crossing_penalty(CrossingType.UNKNOWN, 'major', config)
+        for crossed in (crossed_road_at_junction(edge_tags, to_tags),
+                        crossed_road_leaving_junction(edge_tags, from_tags)):
+            if crossed is not None:
+                cost += crossing_penalty(CrossingType.UNKNOWN, crossed, config)
         return cost
     island = onto_island
     # Stepping onto a crossing node: charge the crossing once, here.

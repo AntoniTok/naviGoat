@@ -19,8 +19,9 @@ from guide_core.geo import latlon_to_enu
 from guide_core.polyline import simplify_polyline
 from guide_core.route import MIN_SEGMENT_LENGTH, Route
 from guide_core.walk_costs import (CostConfig, CrossingType, WalkwayClass, classify_crossing,
-                                   crosses_major_junction, edge_cost, is_island_tagged, is_road,
-                                   walkway_class)
+                                   crossed_road_at_junction, crossed_road_leaving_junction,
+                                   edge_cost, has_sidewalk,
+                                   is_island_tagged, is_road, is_tunnel, walkway_class)
 
 
 class PlanningError(ValueError):
@@ -46,26 +47,62 @@ def _is_finite_number(value):
 class PlannerConfig:
     """Planner settings.
 
-    max_snap_distance: furthest (m) a start/goal may be from a usable graph
-    node. simplify_tolerance: Douglas-Peucker tolerance (m).
+    walkway_snap_distance: a start/goal snaps to the nearest walkway node
+    (footway, pedestrian street or path; not a crossing node or island) within
+    this distance (m). Destinations looked up by name are often a building's
+    centre, tens of metres from the pavement, so this is generous.
+    max_snap_distance: with no walkway that close, the start/goal may snap to
+    any surface node (e.g. a road centre line) within this distance (m); the
+    plan then carries a warning. goal_snap_slack / goal_snap_weight: the goal
+    is the walkway node, at most goal_snap_slack (m) further than the nearest
+    one, with the lowest route cost + goal_snap_weight x snap distance (m).
+    So a node a little further away beats a nearer one that is a long way
+    round, but the goal never moves across a road to save a crossing (30 per
+    unguided metre outweighs any crossing penalty over a road's width).
+    simplify_tolerance: Douglas-Peucker
+    tolerance (m).
     crossing_half_width: assumed half-width (m) of a crossing known only from
-    its crossing node (no mapped crossing way). junction_half_width: assumed
-    half-width (m) of a major road crossed by walking along a minor road
-    through a junction (the junction node is on the major road's centre
-    line). island_max_length: a piece of
+    its crossing node (no mapped crossing way). junction_half_width /
+    side_street_half_width: assumed half-width (m) of a major / minor road
+    crossed by walking along a road through a junction (the junction node is
+    on the crossed road's centre line). island_max_length: a piece of
     walkway reachable only over crossings counts as a pedestrian island if its
-    walkways add up to at most this (m). costs: edge cost weights.
+    walkways add up to at most this (m). detour_warning_ratio /
+    detour_warning_extra: a plan whose route is more than ratio x the
+    straight-line distance AND more than extra (m) longer carries a warning.
+    costs: edge cost weights.
     """
 
+    walkway_snap_distance: float = 60.0
+    goal_snap_slack: float = 15.0
+    goal_snap_weight: float = 30.0
     max_snap_distance: float = 30.0
     simplify_tolerance: float = 0.5
     crossing_half_width: float = 3.0
     junction_half_width: float = 10.0
+    side_street_half_width: float = 5.0
     island_max_length: float = 30.0
+    detour_warning_ratio: float = 3.0
+    detour_warning_extra: float = 300.0
     costs: CostConfig = field(default_factory=CostConfig)
 
     def __post_init__(self):
         """Validate all values."""
+        if not _is_finite_number(self.goal_snap_slack) or self.goal_snap_slack < 0.0:
+            raise ValueError(f'goal_snap_slack must be finite and >= 0, '
+                             f'got {self.goal_snap_slack!r}')
+        if not _is_finite_number(self.goal_snap_weight) or self.goal_snap_weight < 0.0:
+            raise ValueError(f'goal_snap_weight must be finite and >= 0, '
+                             f'got {self.goal_snap_weight!r}')
+        if not _is_finite_number(self.walkway_snap_distance) or self.walkway_snap_distance <= 0.0:
+            raise ValueError(f'walkway_snap_distance must be finite and > 0, '
+                             f'got {self.walkway_snap_distance!r}')
+        if not _is_finite_number(self.detour_warning_ratio) or self.detour_warning_ratio < 1.0:
+            raise ValueError(f'detour_warning_ratio must be finite and >= 1, '
+                             f'got {self.detour_warning_ratio!r}')
+        if not _is_finite_number(self.detour_warning_extra) or self.detour_warning_extra < 0.0:
+            raise ValueError(f'detour_warning_extra must be finite and >= 0, '
+                             f'got {self.detour_warning_extra!r}')
         if not _is_finite_number(self.max_snap_distance) or self.max_snap_distance <= 0.0:
             raise ValueError(f'max_snap_distance must be finite and > 0, '
                              f'got {self.max_snap_distance!r}')
@@ -75,6 +112,10 @@ class PlannerConfig:
         if not _is_finite_number(self.crossing_half_width) or self.crossing_half_width <= 0.0:
             raise ValueError(f'crossing_half_width must be finite and > 0, '
                              f'got {self.crossing_half_width!r}')
+        if not _is_finite_number(self.side_street_half_width) \
+                or self.side_street_half_width <= 0.0:
+            raise ValueError(f'side_street_half_width must be finite and > 0, '
+                             f'got {self.side_street_half_width!r}')
         if not _is_finite_number(self.junction_half_width) or self.junction_half_width <= 0.0:
             raise ValueError(f'junction_half_width must be finite and > 0, '
                              f'got {self.junction_half_width!r}')
@@ -92,6 +133,8 @@ class PlannedRoute:
     route: the simplified route in the map (ENU) frame.
     latlons: (lat, lon) of each route point, in the same order.
     crossings: RouteCrossing tuple, in route order.
+    warnings: plain-language reasons to doubt the route (snapped to a road,
+    a long detour); empty for a normal plan.
     """
 
     route: Route
@@ -99,6 +142,7 @@ class PlannedRoute:
     start_snap_distance: float
     goal_snap_distance: float
     crossings: tuple
+    warnings: tuple = ()
 
     @property
     def length(self):
@@ -161,11 +205,35 @@ class RoutePlanner:
                 self._cost[(u, v)] = cost
                 self._edge_tags[(u, v)] = data
 
-        # Only nodes touching at least one usable edge can be snapped to.
+        # Snap targets: nodes touching at least one usable edge. The start
+        # (the robot's GPS position) is always on the surface; a goal may be
+        # underground (a station reached through a pedestrian subway).
         usable = {u for u, _ in self._cost} | {v for _, v in self._cost}
-        self._usable = [(node, self._xy[node]) for node in graph.nodes if node in usable]
+        underground = set()
+        for u, v, data in graph.edges(data=True):
+            if is_tunnel(data):
+                underground.update((u, v))
+        all_usable = [(node, self._xy[node]) for node in graph.nodes if node in usable]
+        self._usable = [(node, xy) for node, xy in all_usable if node not in underground]
         if not self._usable:
-            raise ValueError('graph has no usable walkways')
+            raise ValueError('graph has no usable surface walkways')
+        # Preferred snap targets: surface nodes on a walkway (footway,
+        # pedestrian street, path, or a street whose pavement is tagged on
+        # it), never in the middle of a road (crossing nodes) or on an
+        # island. Other roads are only the fallback.
+        walkway = set()
+        for (u, v), data in self._edge_tags.items():
+            on_foot = (walkway_class(data.get('highway')) is WalkwayClass.WALKWAY
+                       or has_sidewalk(data))  # a street with its pavement tagged on it
+            if on_foot and _value(data, 'footway') != 'crossing':
+                walkway.update((u, v))
+        # Goal candidates may be underground; start candidates may not.
+        self._goal_walkway_nodes = [
+            (node, xy) for node, xy in all_usable
+            if node in walkway and node not in self._island_nodes
+            and _value(graph.nodes[node], 'highway') != 'crossing']
+        self._walkway_nodes = [(node, xy) for node, xy in self._goal_walkway_nodes
+                               if node not in underground]
 
     @property
     def config(self):
@@ -174,7 +242,7 @@ class RoutePlanner:
 
     @property
     def usable_node_count(self):
-        """Number of nodes a start or goal can snap to."""
+        """Number of nodes a start or goal can snap to (surface nodes only)."""
         return len(self._usable)
 
     @property
@@ -190,17 +258,36 @@ class RoutePlanner:
         for value in (start_lat, start_lon, goal_lat, goal_lon):
             if not _is_finite_number(value):
                 raise PlanningError(f'coordinates must be finite numbers, got {value!r}')
-        start_node, start_dist = self._snap(start_lat, start_lon, 'start')
-        goal_node, goal_dist = self._snap(goal_lat, goal_lon, 'goal')
+        warnings = []
+        no_route = PlanningError('No walkable route between start and goal '
+                                 '(steps and indoor corridors are not allowed).')
+        start_node, start_dist = self._snap(start_lat, start_lon, 'start', warnings)
+
+        # Goal: the best walkway node near the goal point (route cost + a
+        # charge per metre of snapping), found with one Dijkstra run from the
+        # start; with no walkway near, the nearest node of any kind.
+        candidates = self._near_walkway_nodes(goal_lat, goal_lon)
+        if candidates:
+            costs, paths = nx.single_source_dijkstra(self._graph, start_node,
+                                                     weight=self._weight)
+            weight = self._config.goal_snap_weight
+            reachable = [(costs[node] + weight * dist, dist, node)
+                         for node, dist in candidates if node in costs]
+            if not reachable:
+                raise no_route
+            _, goal_dist, goal_node = min(reachable, key=lambda c: (c[0], c[1]))
+            path = paths[goal_node]
+        else:
+            goal_node, goal_dist = self._snap(goal_lat, goal_lon, 'goal', warnings)
+            path = None
         if start_node == goal_node:
             raise PlanningError('Start and goal are at the same point on the walking graph '
                                 '(already at the destination).')
-
-        try:
-            path = nx.dijkstra_path(self._graph, start_node, goal_node, weight=self._weight)
-        except nx.NetworkXNoPath:
-            raise PlanningError('No walkable route between start and goal '
-                                '(steps and indoor corridors are not allowed).') from None
+        if path is None:
+            try:
+                path = nx.dijkstra_path(self._graph, start_node, goal_node, weight=self._weight)
+            except nx.NetworkXNoPath:
+                raise no_route from None
 
         crossing_spans = self._find_crossings(path)
 
@@ -241,8 +328,9 @@ class RoutePlanner:
             if centre is None:  # mapped crossing way: kerb to kerb
                 start_s, end_s = along[position[first]], along[position[last]]
             else:  # crossing / junction node only: assume half-width either side of it
-                half = (self._config.junction_half_width if junction
-                        else self._config.crossing_half_width)
+                half = {'major': self._config.junction_half_width,
+                        'minor': self._config.side_street_half_width,
+                        }.get(junction, self._config.crossing_half_width)
                 s_node = along[position[centre]]
                 start_s, end_s = max(0.0, s_node - half), min(total, s_node + half)
             crossings.append(RouteCrossing(start_s=start_s, end_s=end_s,
@@ -250,9 +338,26 @@ class RoutePlanner:
                                            crossed_road=crossed_road, tactile_paving=tactile,
                                            has_island=island))
 
+        # No GPS underground: say how much of the route is in tunnels.
+        tunnel_m = sum(math.dist(self._xy[u], self._xy[v]) for u, v in zip(path, path[1:])
+                       if is_tunnel(self._edge_tags[(u, v)]))
+        if tunnel_m > 0.0:
+            warnings.append(f'route uses {tunnel_m:.0f} m of tunnel (no GPS there)')
+
+        # A route much longer than the straight line usually means a badly
+        # placed start/goal (e.g. a building's centre) or a gap in the map.
+        straight = math.dist(latlon_to_enu(start_lat, start_lon, *self._origin),
+                             latlon_to_enu(goal_lat, goal_lon, *self._origin))
+        cfg = self._config
+        if route.total_length > cfg.detour_warning_ratio * straight \
+                and route.total_length - straight > cfg.detour_warning_extra:
+            warnings.append(f'route is {route.total_length / max(straight, 1e-9):.1f}x the '
+                            f'straight-line distance ({route.total_length:.0f} m vs '
+                            f'{straight:.0f} m)')
+
         return PlannedRoute(route=route, latlons=tuple(latlons),
                             start_snap_distance=start_dist, goal_snap_distance=goal_dist,
-                            crossings=tuple(crossings))
+                            crossings=tuple(crossings), warnings=tuple(warnings))
 
     def _find_untagged_islands(self, graph):
         """Return the nodes of pedestrian islands found from the graph's shape.
@@ -320,19 +425,52 @@ class RoutePlanner:
         """Dijkstra edge weight; None hides the edge (forbidden)."""
         return self._cost.get((u, v))
 
-    def _snap(self, lat, lon, what):
-        """Return (nearest usable node, distance in m), or raise PlanningError if too far."""
+    def _near_walkway_nodes(self, lat, lon):
+        """Return [(node, distance m)]: walkway nodes the goal may snap to.
+
+        Within walkway_snap_distance of the point, and at most goal_snap_slack
+        further than the nearest walkway node.
+        """
         x, y = latlon_to_enu(lat, lon, *self._origin)
-        best_node, best_dist = None, math.inf
-        for node, (node_x, node_y) in self._usable:
+        cfg = self._config
+        near = []
+        for node, (node_x, node_y) in self._goal_walkway_nodes:
             d = math.hypot(node_x - x, node_y - y)
-            if d < best_dist:
-                best_node, best_dist = node, d
-        limit = self._config.max_snap_distance
-        if best_dist > limit:
-            raise PlanningError(f'The {what} is {best_dist:.1f} m from the nearest walkway '
-                                f'(limit {limit:.1f} m).')
-        return best_node, best_dist
+            if d <= cfg.walkway_snap_distance:
+                near.append((node, d))
+        if not near:
+            return []
+        nearest = min(d for _, d in near)
+        return [(node, d) for node, d in near if d <= nearest + cfg.goal_snap_slack]
+
+    def _snap(self, lat, lon, what, warnings):
+        """Return (node, distance in m) for a start/goal point.
+
+        The nearest walkway node within walkway_snap_distance; else the
+        nearest surface node of any kind within max_snap_distance, adding a
+        warning to `warnings`; else PlanningError.
+        """
+        x, y = latlon_to_enu(lat, lon, *self._origin)
+
+        def nearest(candidates):
+            best_node, best_dist = None, math.inf
+            for node, (node_x, node_y) in candidates:
+                d = math.hypot(node_x - x, node_y - y)
+                if d < best_dist:
+                    best_node, best_dist = node, d
+            return best_node, best_dist
+
+        cfg = self._config
+        walk_node, walk_dist = nearest(self._walkway_nodes)
+        if walk_dist <= cfg.walkway_snap_distance:
+            return walk_node, walk_dist
+        any_node, any_dist = nearest(self._usable)
+        if any_dist <= cfg.max_snap_distance:
+            warnings.append(f'{what} is {walk_dist:.1f} m from the nearest walkway; snapped '
+                            f'{any_dist:.1f} m to a road')
+            return any_node, any_dist
+        raise PlanningError(f'The {what} is {walk_dist:.1f} m from the nearest walkway '
+                            f'(limit {cfg.walkway_snap_distance:.1f} m).')
 
     def _find_crossings(self, path):
         """Return (first, last, centre, type, crossed_road, tactile, island, junction) per crossing.
@@ -342,9 +480,12 @@ class RoutePlanner:
         centre = None),
         or a crossing node reached from a walkway outside any such run
         (centre = its path index; first/last = its neighbours, used only to
-        collect tags), or a junction with a major road reached along a minor
-        road (junction = True, centre = its path index; crossed road 'major',
-        type unknown: there is no crossing facility). island: a node of the
+        collect tags), or a road junction reached along a road, or left along
+        a minor road where a major road meets (junction = the class of road
+        crossed, 'major' or 'minor', see crossed_road_at_junction and
+        crossed_road_leaving_junction; 'major' wins;
+        centre = its path index; type unknown: there is no crossing facility;
+        junction is None for the other kinds). island: a node of the
         span is a pedestrian island node, or a crossing node or edge of the
         span is tagged as an island.
         """
@@ -372,24 +513,32 @@ class RoutePlanner:
                 i = j + 1
             else:
                 i += 1
-        for k in range(1, len(path)):
-            edge = self._edge_tags[(path[k - 1], path[k])]
-            if crosses_major_junction(edge, graph.nodes[path[k]]):
-                spans.append((k - 1, min(k + 1, len(path) - 1), k, True))
+        for k in range(len(path)):
+            node = graph.nodes[path[k]]
+            entering = (crossed_road_at_junction(self._edge_tags[(path[k - 1], path[k])], node)
+                        if k > 0 else None)
+            leaving = (crossed_road_leaving_junction(
+                self._edge_tags[(path[k], path[k + 1])], node) if k + 1 < len(path) else None)
+            crossed = 'major' if 'major' in (entering, leaving) else entering
+            if crossed is not None:
+                spans.append((max(k - 1, 0), min(k + 1, len(path) - 1), k, crossed))
                 continue
+            if k == 0:
+                continue
+            edge = self._edge_tags[(path[k - 1], path[k])]
             if k in covered or _value(graph.nodes[path[k]], 'highway') != 'crossing':
                 continue
             if is_road(edge.get('highway')):
                 continue  # walking along a road through a crossing point
-            spans.append((k - 1, min(k + 1, len(path) - 1), k, False))
-        spans = [span if len(span) == 4 else span + (False,) for span in spans]
+            spans.append((k - 1, min(k + 1, len(path) - 1), k, None))
+        spans = [span if len(span) == 4 else span + (None,) for span in spans]
         spans.sort(key=lambda span: span[0])
 
         result = []
         for first, last, centre, junction in spans:
-            if junction:
-                result.append((first, last, centre, CrossingType.UNKNOWN, 'major', False,
-                               False, True))
+            if junction is not None:
+                result.append((first, last, centre, CrossingType.UNKNOWN, junction, False,
+                               False, junction))
                 continue
             node_tags = [graph.nodes[path[k]] for k in range(first, last + 1)
                          if _value(graph.nodes[path[k]], 'highway') == 'crossing']
@@ -402,5 +551,5 @@ class RoutePlanner:
             island = (any(path[k] in self._island_nodes for k in range(first, last + 1))
                       or any(is_island_tagged(tags) for tags in edge_tags))
             result.append((first, last, centre, crossing_type, crossed_road, tactile, island,
-                           False))
+                           None))
         return result
