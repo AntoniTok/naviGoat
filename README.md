@@ -39,12 +39,10 @@ docker run --rm -it --name navigoat-dev --network=host --device=/dev/ttyUSB0:/de
 
 ### Open the running container in a terminal
 
-1. Run `docker ps` on the host and copy the container name.
-2. Replace `CONTAINER_NAME` below to open a shell in the same container:
+Run on the host to open a shell in the running container:
 
 ```bash
-docker ps
-docker exec -it <CONTAINER_NAME> bash
+docker exec -it navigoat-dev bash
 ```
 
 ### Build and run bringup
