@@ -33,12 +33,17 @@ RUN if [ "$VOICE" = "true" ]; then \
         python3 -m pip install --no-cache-dir --break-system-packages "numpy<2" sounddevice faster-whisper; \
     fi
 
-# Pete's language model (ros/src/core/llm.py): the anthropic package for Claude, and the small local vision model that
-# answers without a key or a connection. A layer of its own, after the others, so adding it does not rebuild them.
+# Pete's language model (ros/src/core/llm.py): the anthropic package for Claude, and the small local vision model
+# (LFM2.5-VL 1.6B) that answers without a key or a connection. The model's two files are fetched with curl, not
+# "ollama pull hf.co/...": on networks that reach the internet through NAT64 (the university's), Ollama refuses the
+# download server's address. A layer of its own, after the others, so adding it does not rebuild them.
+COPY docker/lfm2.5-vl.Modelfile /tmp/lfm/Modelfile
 RUN if [ "$PETE" = "true" ]; then \
-        python3 -m pip install --no-cache-dir --break-system-packages anthropic && \
-        (ollama serve > /dev/null 2>&1 &) && sleep 5 && ollama pull hf.co/LiquidAI/LFM2.5-VL-1.6B-GGUF:Q4_K_M; \
-    fi
+        python3 -m pip install --no-cache-dir --break-system-packages anthropic && cd /tmp/lfm && \
+        curl -fL --retry 5 --retry-all-errors -o model.gguf https://huggingface.co/LiquidAI/LFM2.5-VL-1.6B-GGUF/resolve/main/LFM2.5-VL-1.6B-Q4_K_M.gguf && \
+        curl -fL --retry 5 --retry-all-errors -o mmproj.gguf https://huggingface.co/LiquidAI/LFM2.5-VL-1.6B-GGUF/resolve/main/mmproj-LFM2.5-VL-1.6b-Q8_0.gguf && \
+        (ollama serve > /dev/null 2>&1 &) && sleep 5 && ollama create lfm2.5-vl:1.6b -f Modelfile; \
+    fi && rm -rf /tmp/lfm
 
 RUN printf '\nsource /opt/ros/jazzy/setup.bash\nif [ -f /workspace/install/setup.bash ]; then source /workspace/install/setup.bash; fi\n' >> /etc/bash.bashrc
 

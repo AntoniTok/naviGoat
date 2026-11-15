@@ -17,7 +17,7 @@ import urllib.request
 OLLAMA_URL = 'http://localhost:11434/api/chat'
 # Chosen on Pete's own two jobs against Qwen3-VL 2B (2.0 GB loaded): 0.88 GB loaded, the same 8 of 11 middleman requests
 # right, descriptions in under a second on the laptop. The 450M version was too weak (a pizza photo became a bedroom).
-LOCAL_MODEL = os.environ.get('PETE_LOCAL_MODEL', 'hf.co/LiquidAI/LFM2.5-VL-1.6B-GGUF:Q4_K_M')
+LOCAL_MODEL = os.environ.get('PETE_LOCAL_MODEL', 'lfm2.5-vl:1.6b')
 OLLAMA_OPTIONS = {'num_ctx': 4096}  # identical on every request, or Ollama reloads the model
 
 CLOUD_MODEL = os.environ.get('PETE_CLOUD_MODEL', 'claude-haiku-5-5')
