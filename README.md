@@ -19,17 +19,17 @@ docker build -f docker/Dockerfile.dev -t navigoat:dev .
 
 ### Start the container from a terminal
 
-From the repository root, allow the container to open GUI applications and start it:
+From the repository root, allow the container to open GUI applications and start it. The lidar is mapped from `/dev/ttyUSB0` to `/dev/unilidar` and the Pioneer from `/dev/ttyUSB1` to `/dev/pioneer`. Replace the host USB paths as needed:
 
 ```bash
 xhost +si:localuser:root
-docker run --rm -it --name navigoat-dev --network=host -e DISPLAY -v "$PWD:/workspace" -v /tmp/.X11-unix:/tmp/.X11-unix:ro navigoat:dev bash
+docker run --rm -it --name navigoat-dev --network=host --device=/dev/ttyUSB0:/dev/unilidar --device=/dev/ttyUSB1:/dev/pioneer -e DISPLAY -v "$PWD:/workspace" -v /tmp/.X11-unix:/tmp/.X11-unix:ro navigoat:dev bash
 ```
 
 For Pete (object finding and scene description), build with `--build-arg PETE=true` and pass the camera and GPU. `--gpus all` needs the NVIDIA Container Toolkit. See [ros/src/autonomy/perception/README.md](ros/src/autonomy/perception/README.md), including the Jetson build.
 
 ```bash
-docker run --rm -it --name navigoat-dev --network=host --gpus all --device /dev/video0 -e DISPLAY -v "$PWD:/workspace" -v /tmp/.X11-unix:/tmp/.X11-unix:ro navigoat:dev bash
+docker run --rm -it --name navigoat-dev --network=host --device=/dev/ttyUSB0:/dev/unilidar --device=/dev/ttyUSB1:/dev/pioneer --gpus all --device /dev/video0 -e DISPLAY -v "$PWD:/workspace" -v /tmp/.X11-unix:/tmp/.X11-unix:ro navigoat:dev bash
 ```
 
 ### Open in VS Code
