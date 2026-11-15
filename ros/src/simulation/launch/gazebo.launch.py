@@ -5,12 +5,15 @@ from launch import LaunchDescription
 from launch.actions import AppendEnvironmentVariable, ExecuteProcess, IncludeLaunchDescription
 from launch.substitutions import Command, PathJoinSubstitution, LaunchConfiguration
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 
 def generate_launch_description():
     p2os_share = get_package_share_directory('p2os_urdf')
     simulation_dir = os.path.dirname(os.path.dirname(__file__))
-    robot_description = Command(['xacro ', os.path.join(simulation_dir, 'description', 'pioneer3at_lidar.xacro')])
+    # value_type=str: the URDF is text. Without it, launch reads it as YAML and fails on any ": " in it, comments included.
+    robot_description = ParameterValue(
+        Command(['xacro ', os.path.join(simulation_dir, 'description', 'pioneer3at_lidar.xacro')]), value_type=str)
 
     world_path = PathJoinSubstitution([
         simulation_dir,
