@@ -15,7 +15,7 @@
 //
 // To add a rule: write a function like groupCost() that gives the cost at one point, and paint() it in updateCosts().
 
-// how a costmap works, quickly: it's a grid of cells (5 cm each for us), and each cell has a cost from 0 (free) to
+// how a costmap works: it's a grid of cells (5 cm each for us), and each cell has a cost from 0 (free) to
 // 254 (lethal = an obstacle). Nav2's planner looks for the cheapest path through it. the costmap is made of layers
 // stacked on top of each other: the map, the obstacles, our people, then the inflation around everything.
 // every layer gets two calls per update: updateBounds() ("which part of the map do you want to change?") and then
