@@ -123,7 +123,14 @@ def main():
     node.create_subscription(String, topic['done_topic'], on_done, 10, callback_group=group)
     node.create_subscription(String, topic['status_topic'], on_object_status, 10, callback_group=group)
     node.create_subscription(String, topic['description_topic'], on_description, 10, callback_group=group)
-    node.get_logger().info(f"Middleman ready. Qwen is {'on' if interpreter else 'off'}.")
+    import llm
+    if not interpreter:
+        model = 'off (rules only)'
+    elif llm.cloud_available():
+        model = f'{llm.CLOUD_MODEL}, the local {llm.LOCAL_MODEL} as fallback'
+    else:
+        model = f'the local {llm.LOCAL_MODEL} (no API key)'
+    node.get_logger().info(f'Middleman ready. Language model: {model}.')
     executor = MultiThreadedExecutor(num_threads=4)
     executor.add_node(node)
     try:

@@ -8,8 +8,11 @@ small local vision model through Ollama. Both get the same instructions, so the 
     PETE_LOCAL_MODEL    default the LFM2.5-VL 1.6B below
 """
 
+import concurrent.futures
 import json
 import os
+import socket
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -21,12 +24,37 @@ LOCAL_MODEL = os.environ.get('PETE_LOCAL_MODEL', 'lfm2.5-vl:1.6b')
 OLLAMA_OPTIONS = {'num_ctx': 4096}  # identical on every request, or Ollama reloads the model
 
 CLOUD_MODEL = os.environ.get('PETE_CLOUD_MODEL', 'claude-haiku-5-5')
-CLOUD_TIMEOUT = 4.0  # seconds before giving up on Claude and asking the local model
-CLOUD_RETRY_AFTER = 30.0  # after a failure, seconds of local-only answers, so being offline doesn't cost 4 s every time
+CLOUD_TIMEOUT = 4.0  # seconds before giving up on Claude and asking the local model, the address lookup included
+CLOUD_RETRY_AFTER = 30.0  # after a rate limit or a server error, seconds of local-only answers
+CLOUD_HOST = 'api.anthropic.com'
+PROBE_EVERY = 10.0  # while offline, seconds between background checks that Claude can be reached again
 
 _client = None
 _cloud_off_until = 0.0
 _cloud_disabled = False
+# Offline: no request waits for Claude; a background thread checks for the connection and clears this. Without it, on
+# the Jetson with Wi-Fi off, each attempt hung for 23 s looking up Claude's address, which the client's timeout misses.
+_offline = threading.Event()
+_pool = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+
+
+def _probe():
+    """Runs while offline: clear _offline once Claude's server can be reached again."""
+    while _offline.is_set():
+        time.sleep(PROBE_EVERY)
+        try:
+            socket.create_connection((CLOUD_HOST, 443), timeout=3).close()
+            _offline.clear()
+            print('llm: online again, using Claude.', flush=True)
+        except OSError:
+            pass
+
+
+def _went_offline():
+    if not _offline.is_set():
+        _offline.set()
+        print('llm: Claude cannot be reached; using the local model until the connection is back.', flush=True)
+        threading.Thread(target=_probe, daemon=True).start()
 
 
 def _cloud_client():
@@ -45,7 +73,8 @@ def _cloud_client():
 
 
 def cloud_available():
-    return not _cloud_disabled and _cloud_client() is not None and time.monotonic() >= _cloud_off_until
+    return (not _cloud_disabled and _cloud_client() is not None and not _offline.is_set()
+            and time.monotonic() >= _cloud_off_until)
 
 
 def ask_cloud(system, text, image=None, schema=None, max_tokens=1024):
@@ -61,9 +90,13 @@ def ask_cloud(system, text, image=None, schema=None, max_tokens=1024):
     output_config = {'effort': 'low'}  # short answers: little thinking, quicker and cheaper
     if schema:
         output_config['format'] = {'type': 'json_schema', 'schema': schema}
+    call = _pool.submit(_client.messages.create, model=CLOUD_MODEL, max_tokens=max_tokens, system=system,
+                        messages=[{'role': 'user', 'content': content}], output_config=output_config)
     try:
-        response = _client.messages.create(model=CLOUD_MODEL, max_tokens=max_tokens, system=system,
-                                           messages=[{'role': 'user', 'content': content}], output_config=output_config)
+        response = call.result(timeout=CLOUD_TIMEOUT)  # a hard limit: the client's own timeout misses the address lookup
+    except concurrent.futures.TimeoutError:
+        _went_offline()
+        return None
     except anthropic.AuthenticationError:
         print('llm: the Anthropic API key was rejected; using the local model only.', flush=True)
         _cloud_disabled = True
@@ -75,8 +108,8 @@ def ask_cloud(system, text, image=None, schema=None, max_tokens=1024):
         print(f'llm: Claude answered with an error ({error.status_code}); using the local model.', flush=True)
         _cloud_off_until = time.monotonic() + CLOUD_RETRY_AFTER
         return None
-    except anthropic.APIConnectionError:  # offline or slower than CLOUD_TIMEOUT
-        _cloud_off_until = time.monotonic() + CLOUD_RETRY_AFTER
+    except anthropic.APIConnectionError:  # offline
+        _went_offline()
         return None
     if response.stop_reason == 'refusal':
         return None

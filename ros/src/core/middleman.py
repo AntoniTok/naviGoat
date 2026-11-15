@@ -271,7 +271,11 @@ def qwen_interpreter(locations=LOCATIONS, saved=None, url=OLLAMA_URL, model=QWEN
         try:
             if (answer := llm.ask_cloud(prompt, text, schema=schema, max_tokens=512)) is not None:
                 result = json.loads(answer)
-            else:  # no key, offline, or Claude was slow: the local model
+            elif minimum > CONFIDENCE_THRESHOLD:
+                # An unknown name ("walk me to the bottom"): the local model claims to be sure of a wrong place every time
+                # ("iphone" -> computer room, "dean office" -> office), so offline the user hears "I don't know where".
+                return None
+            else:  # no key, offline, or Claude was slow: the local model, for a need ("I'm hungry" -> pret)
                 request = urllib.request.Request(url, json.dumps(body).encode(), {'Content-Type': 'application/json'})
                 with urllib.request.urlopen(request, timeout=timeout) as response:
                     result = json.loads(json.load(response)['message']['content'])

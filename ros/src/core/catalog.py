@@ -73,7 +73,7 @@ OBJECT_ALIASES = {
     'potted plant': 'plant', 'flower pot': 'plant', 'flowers': 'vase',
     'television': 'tv', 'television set': 'tv', 'monitor': 'tv', 'screen': 'tv', 'computer screen': 'tv',
     'computer': 'laptop', 'remote control': 'remote', 'tv remote': 'remote', 'phone': 'cell phone',
-    'mobile phone': 'cell phone', 'mobile': 'cell phone', 'smartphone': 'cell phone', 'earphones': 'headphones',
+    'mobile phone': 'cell phone', 'mobile': 'cell phone', 'smartphone': 'cell phone', 'iphone': 'cell phone', 'earphones': 'headphones',
     'headset': 'headphones', 'cable': 'charger',
     'fridge': 'refrigerator', 'water bottle': 'bottle', 'mug': 'cup', 'glass': 'cup',
     'wine glass': 'cup', 'dish': 'plate',
