@@ -43,18 +43,6 @@ The two feedback topics are in exactly the same `[side, magnitude]` format as `/
 
 There are three Python nodes, one C++ plugin that runs inside Nav2, and a message package:
 
-```
-middleman  --/middleman/mode-->  places_node  --navigate_to_pose action-->  Nav2  --/plan-->  feedback_node --> handle / wristband
-perception --/object_mapping-->       |                                       ^                     ^
-                                      v                                       |                     |
-                          /middleman/done, /pete/response              social_layer               /people
-                                                                  (inside Nav2's costmaps)          |
-Enid's tracker  --/social_perception/tracks-->  people_node  -------------/people-----------------+
-RViz clicks, fake_people.yaml  ------------------^
-```
-
-In words:
-
 1. **people_node** collects everyone we know about: the people Enid's tracker sees (it gives them relative to the camera, so we move them onto the map using TF), people you click in RViz, and fake people from a yaml file for testing. It works out how fast each person walks, and sends everyone on `/people` 10 times a second.
 2. **social_layer** is a plugin that lives inside Nav2's costmaps (the grids Nav2 uses to plan, where each cell has a cost). It reads `/people` and draws costs around them: each person is an obstacle, they have a personal space, there's an expensive strip between two people who are together, and an expensive strip where walkers are about to go. So when Nav2 plans a path, it automatically goes around people.
 3. **places_node** decides *where* to go. The middleman tells it the mode (go to a place, go to an object, stop...), it looks up the place in its saved places (or waits for perception to find the object), and sends the goal to Nav2. When Nav2 finishes, it tells the middleman we arrived, or Pete says it failed.
@@ -101,7 +89,7 @@ If you change `social_layer.cpp` you need to build again and restart Nav2. The P
 
 ## Testing in Gazebo
 
-### 1. Make a map (once per world)
+### 1. Make a map
 
 ```bash
 ros2 launch /workspace/ros/src/autonomy/navigation/navigation_nodes/launch/navigation_sim.launch.py mode:=mapping
@@ -165,7 +153,7 @@ The social layer is in both of Nav2's costmaps, just before the inflation layer 
 
 | Rule | What it does | Parameters (defaults) |
 | --- | --- | --- |
-| The person | the person is an obstacle (lethal) | `person_radius` 0.3 m |
+| The person | the person is an obstacle | `person_radius` 0.3 m |
 | Personal space | a cost around them that fades to 0, and reaches further in front of someone walking | `personal_space` 1.0 m, `personal_space_cost` 150, `motion_stretch` 1.0 m per m/s |
 | Groups | two people closer than `group_distance` count as together, and the strip between them is expensive, so the robot goes around them if it can | `group_distance` 2.2 m, `group_width` 0.6 m, `group_cost` 220 |
 | Where walkers are going | an expensive strip along where each walker will be in the next `prediction_time` seconds, strongest right in front of them | `prediction_time` 2.0 s (0 = off), `prediction_width` 1.0 m, `prediction_cost` 200 |
