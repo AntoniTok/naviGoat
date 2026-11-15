@@ -105,12 +105,12 @@ _VAGUE_WORDS = {'pete', 'go', 'going', 'take', 'bring', 'lead', 'guide', 'walk',
 # Places the user sets once, e.g. {'home': (Mode.GPS, '12 main street')}.
 SAVED_NAMES = ('home', 'work')
 
-# The same local Ollama and model that Pete uses (ros/src/autonomy/perception/classification.py).
-OLLAMA_URL = 'http://localhost:11434/api/chat'
-# Must be the same as OLLAMA_OPTIONS in autonomy/perception/scene_description.py: the scene description uses the same model, and
-# Ollama reloads it (seconds on the Jetson, and it can end up on the CPU) whenever two callers ask with different settings.
-OLLAMA_OPTIONS = {'num_ctx': 4096}
-QWEN_MODEL = 'qwen3-vl:2b-instruct'
+# The model the scene description also uses (core/llm.py): Claude with a key and a connection, otherwise the local one
+import llm  # noqa: E402
+
+OLLAMA_URL = llm.OLLAMA_URL
+OLLAMA_OPTIONS = llm.OLLAMA_OPTIONS  # shared with the scene description, so Ollama never reloads the model
+QWEN_MODEL = llm.LOCAL_MODEL  # the name is from when this was Qwen
 
 QWEN_MODES = ('follow', 'object', 'location', 'gps', 'manual', 'perception', 'stop', 'help', 'unknown')
 QWEN_SCHEMA = {'type': 'object', 'properties': {'mode': {'enum': list(QWEN_MODES)}, 'target': {'type': 'string'}, 'match': {'type': 'string'}, 'confidence': {'type': 'number'}}, 'required': ['mode', 'target', 'match', 'confidence']}
@@ -256,15 +256,19 @@ def qwen_interpreter(locations=LOCATIONS, saved=None, url=OLLAMA_URL, model=QWEN
     places = ', '.join(f'{p} ({LOCATION_DESCRIPTIONS[p]})' if p in LOCATION_DESCRIPTIONS else p for p in locations)
     prompt = QWEN_PROMPT.format(locations=places, objects=', '.join(OBJECTS))
     names = list(dict.fromkeys(list(locations) + list(OBJECTS))) + ['']
-    schema = {'type': 'object', 'properties': {'match': {'enum': names}, 'confidence': {'type': 'number'}}, 'required': ['match', 'confidence']}
+    schema = {'type': 'object', 'properties': {'match': {'type': 'string', 'enum': names}, 'confidence': {'type': 'number'}},
+              'required': ['match', 'confidence'], 'additionalProperties': False}
 
     def interpret(text, minimum=CONFIDENCE_THRESHOLD):
         messages = [{'role': 'system', 'content': prompt}, {'role': 'user', 'content': text}]
         body = {'model': model, 'stream': False, 'keep_alive': -1, 'format': schema, 'options': {**OLLAMA_OPTIONS, 'num_predict': 40, 'temperature': 0}, 'messages': messages}
         try:
-            request = urllib.request.Request(url, json.dumps(body).encode(), {'Content-Type': 'application/json'})
-            with urllib.request.urlopen(request, timeout=timeout) as response:
-                result = json.loads(json.load(response)['message']['content'])
+            if (answer := llm.ask_cloud(prompt, text, schema=schema, max_tokens=512)) is not None:
+                result = json.loads(answer)
+            else:  # no key, offline, or Claude was slow: the local model
+                request = urllib.request.Request(url, json.dumps(body).encode(), {'Content-Type': 'application/json'})
+                with urllib.request.urlopen(request, timeout=timeout) as response:
+                    result = json.loads(json.load(response)['message']['content'])
         except (urllib.error.URLError, TimeoutError, KeyError, ValueError):
             return None
         try:

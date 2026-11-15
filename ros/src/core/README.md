@@ -46,7 +46,26 @@ ros2 topic pub --once /object_status std_msgs/msg/String "{data: 'not_found:chai
 
 The same package can be built with `colcon build --packages-select middleman --symlink-install` (it has a `package.xml`), so `ros2 run middleman middleman_node` works too.
 
+### The language model: Claude, with a local fallback
+
+[llm.py](llm.py) is shared by the middleman and the scene description. With `ANTHROPIC_API_KEY` set and a connection, both ask Claude (`claude-haiku-5-5`, low effort, 4-second limit). Without a key, offline, or after a failure (then for 30 seconds), both ask the same small local vision model through Ollama, LFM2.5-VL 1.6B: about 0.9 GB loaded, where Qwen3-VL 2B took 2 GB and grew to nearly 4.
+
+The key goes in `~/pete.env` on the Jetson, one line, never committed (template: [pete.env.example](pete.env.example)):
+
+```bash
+echo "ANTHROPIC_API_KEY=sk-ant-..." > ~/pete.env
+```
+
+The image needs the `anthropic` package and the local model: rebuild once with `docker build -f docker/Dockerfile.dev --build-arg PETE=true --build-arg VOICE=true -t navigoat:dev .` (only the new last layer is built).
+
 ### All of Pete at once
+
+On the Jetson, [start_pete.sh](start_pete.sh) does everything: the headset and Whisper (with `voice:=true`), the container with the GPU, camera, sound and `~/pete.env`, Ollama, and the launch file below:
+
+```bash
+~/naviGoat/ros/src/core/start_pete.sh voice:=true
+```
+
 
 [launch/pete.launch.py](launch/pete.launch.py) starts the camera, perception (scene description, then object detection once Qwen has loaded) and the middleman with one command. The container needs the camera (`--privileged -v /dev:/dev`) and the GPU, as in [perception's README](../autonomy/perception/README.md):
 
