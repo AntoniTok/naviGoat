@@ -1,0 +1,15 @@
+# The local vision model for Pete (ros/src/core/llm.py), built from the two files docker/Dockerfile.dev downloads.
+# The same template and stop words Ollama sets up for hf.co/LiquidAI/LFM2.5-VL-1.6B-GGUF:Q4_K_M.
+FROM ./model.gguf
+FROM ./mmproj.gguf
+TEMPLATE """{{ if .System }}<|startoftext|><|im_start|>system
+{{ .System }}<|im_end|>
+{{ end }}{{ if .Prompt }}<|im_start|>user
+{{ .Prompt }}<|im_end|>
+{{ end }}<|im_start|>assistant
+{{ .Response }}<|im_end|>
+"""
+PARAMETER stop <|startoftext|>
+PARAMETER stop <|im_start|>
+PARAMETER stop <|im_end|>
+PARAMETER stop "<|im_start|>user"

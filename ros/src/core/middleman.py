@@ -13,7 +13,7 @@ Modes (the middleman only handles going somewhere, following, and stopping):
 Going to a location, object or GPS destination ends by itself: the code that drives it calls finish() on arrival.
 Following and manual mode have no goal, so they only end when the user says stop or exits the mode.
 
-"Where is X" / "find X" is not handled for now (a spoken reply says so). Everything else is about what the camera
+"Where is X" / "find X" takes the user to X, the same as "take me to X". Everything else is about what the camera
 sees ("what's in front of me", "is the light on?") and is not the middleman's job: the text goes straight to perception over ROS (see middleman_node.py) and the
 mode is unchanged. A place or object that is not in catalog.py gets a spoken reply ("I don't know where the piano is.");
 perception is only asked about objects in the list, so "I couldn't find the chair." means it looked and did not see one.
@@ -87,10 +87,15 @@ _OUTSIDE = re.compile(r"\b(take|bring|get|lead|guide|walk)( me)? (outside|out)\b
 _NEED_PLACE = re.compile(r"\b(i need|i want|i have to|i'd like) (to )?(go to |get to |use |find )?(the )?(?P<target>bathroom|restroom|washroom|toilet|kitchen|exit|pee)\b")
 _NEED_PLACE_ALIASES = {'toilet': 'bathroom', 'pee': 'bathroom'}
 _TWO_STEPS = re.compile(r"\b(and then|then)\b")
-# "Where is X" / "find X": not handled for now, the middleman only takes the user to places.
+# "Where is X" / "find X" is answered by taking the user to X, the same as "take me to X".
 _FIND = re.compile(r"\b(where's|where is|where are|find|locate|look for|is there|do you see|i lost|i've lost|i misplaced|i'm looking for)\b|^where\b")
+_FIND_TARGET = re.compile(r"\b(where's|where is|where are|find|locate|look for|is there|do you see|i lost|i've lost|i misplaced|i'm looking for)\b(?P<target>.*)")
+# The questions perception can answer: it only describes the whole view. These are answered at once with DESCRIBING_REPLY.
+DESCRIBE = re.compile(r"\b(what's|what is|whats|describe)\b.*\b(in front|ahead|around|nearby|near me|happening|room|scene|scenery|surroundings)\b|\bwhat (do|can) you see\b"
+                      r"|\bdescribe\b|\bwhere am i\b|\blook around\b")
+DESCRIBING_REPLY = 'Describing the scene.'
 # Anything about what is around or in view goes to perception.
-_SCENE = re.compile(r"\b(what's|what is|whats|describe|what (do|can) you see|i'd like|i would like|i need|i want|somewhere to|i'm thirsty|i am thirsty)\b|^(what|who|which|is|are|do|does|can|how)\b")
+_SCENE =re.compile(r"\b(what's|what is|whats|describe|what (do|can) you see|i'd like|i would like|i need|i want|somewhere to|i'm thirsty|i am thirsty)\b|^(what|who|which|is|are|do|does|can|how)\b")
 _FILLER = re.compile(r"^(the|a|an|my|any|nearest|closest) | (please|in front of me|around me|here|in the room|nearby|near me|close by)$")
 # Questions about where the user is or what is around: the scene description answers them.
 _LOOK = re.compile(r"\bwhere am i\b|\blook around\b|\bdescribe\b|\bwhat (do|can) you see\b|\bwhat'?s around\b")
@@ -105,12 +110,12 @@ _VAGUE_WORDS = {'pete', 'go', 'going', 'take', 'bring', 'lead', 'guide', 'walk',
 # Places the user sets once, e.g. {'home': (Mode.GPS, '12 main street')}.
 SAVED_NAMES = ('home', 'work')
 
-# The same local Ollama and model that Pete uses (ros/src/autonomy/perception/classification.py).
-OLLAMA_URL = 'http://localhost:11434/api/chat'
-# Must be the same as OLLAMA_OPTIONS in autonomy/perception/scene_description.py: the scene description uses the same model, and
-# Ollama reloads it (seconds on the Jetson, and it can end up on the CPU) whenever two callers ask with different settings.
-OLLAMA_OPTIONS = {'num_ctx': 4096}
-QWEN_MODEL = 'qwen3-vl:2b-instruct'
+# The model the scene description also uses (core/llm.py): Claude with a key and a connection, otherwise the local one
+import llm  # noqa: E402
+
+OLLAMA_URL = llm.OLLAMA_URL
+OLLAMA_OPTIONS = llm.OLLAMA_OPTIONS  # shared with the scene description, so Ollama never reloads the model
+QWEN_MODEL = llm.LOCAL_MODEL  # the name is from when this was Qwen
 
 QWEN_MODES = ('follow', 'object', 'location', 'gps', 'manual', 'perception', 'stop', 'help', 'unknown')
 QWEN_SCHEMA = {'type': 'object', 'properties': {'mode': {'enum': list(QWEN_MODES)}, 'target': {'type': 'string'}, 'match': {'type': 'string'}, 'confidence': {'type': 'number'}}, 'required': ['mode', 'target', 'match', 'confidence']}
@@ -223,7 +228,8 @@ def manual_decision(text):
 
 
 def to_perception(text):
-    return Decision(None, text=text, forward=text)
+    """Send the question to perception. A scene description takes a few seconds, so Pete says he is doing it straight away."""
+    return Decision(None, text=text, forward=text, reply=DESCRIBING_REPLY if DESCRIBE.search(text) else '')
 
 
 def decision_from_mode(mode, target, text, locations, saved, match='', confidence=0.0):
@@ -256,15 +262,23 @@ def qwen_interpreter(locations=LOCATIONS, saved=None, url=OLLAMA_URL, model=QWEN
     places = ', '.join(f'{p} ({LOCATION_DESCRIPTIONS[p]})' if p in LOCATION_DESCRIPTIONS else p for p in locations)
     prompt = QWEN_PROMPT.format(locations=places, objects=', '.join(OBJECTS))
     names = list(dict.fromkeys(list(locations) + list(OBJECTS))) + ['']
-    schema = {'type': 'object', 'properties': {'match': {'enum': names}, 'confidence': {'type': 'number'}}, 'required': ['match', 'confidence']}
+    schema = {'type': 'object', 'properties': {'match': {'type': 'string', 'enum': names}, 'confidence': {'type': 'number'}},
+              'required': ['match', 'confidence'], 'additionalProperties': False}
 
     def interpret(text, minimum=CONFIDENCE_THRESHOLD):
         messages = [{'role': 'system', 'content': prompt}, {'role': 'user', 'content': text}]
         body = {'model': model, 'stream': False, 'keep_alive': -1, 'format': schema, 'options': {**OLLAMA_OPTIONS, 'num_predict': 40, 'temperature': 0}, 'messages': messages}
         try:
-            request = urllib.request.Request(url, json.dumps(body).encode(), {'Content-Type': 'application/json'})
-            with urllib.request.urlopen(request, timeout=timeout) as response:
-                result = json.loads(json.load(response)['message']['content'])
+            if (answer := llm.ask_cloud(prompt, text, schema=schema, max_tokens=512)) is not None:
+                result = json.loads(answer)
+            elif minimum > CONFIDENCE_THRESHOLD:
+                # An unknown name ("walk me to the bottom"): the local model claims to be sure of a wrong place every time
+                # ("iphone" -> computer room, "dean office" -> office), so offline the user hears "I don't know where".
+                return None
+            else:  # no key, offline, or Claude was slow: the local model, for a need ("I'm hungry" -> pret)
+                request = urllib.request.Request(url, json.dumps(body).encode(), {'Content-Type': 'application/json'})
+                with urllib.request.urlopen(request, timeout=timeout) as response:
+                    result = json.loads(json.load(response)['message']['content'])
         except (urllib.error.URLError, TimeoutError, KeyError, ValueError):
             return None
         try:
@@ -324,7 +338,8 @@ def classify_by_rules(text, locations=LOCATIONS, require_wake_word=False, saved=
     if _NO_DESTINATION.search(text):
         return Decision(None, text=text, reply='Where to?')
     if _FIND.search(text) and not (_GUIDE.search(text) or _NEED_PLACE.search(text) or _GPS.search(text)):
-        return Decision(None, text=text, reply="Can't look for things.")
+        match = _FIND_TARGET.search(text)
+        return resolve(clean_target(match.group('target')) if match else '', text, locations, saved)  # "where is the cup" = "take me to the cup"
     if _GPS.search(text):
         match = _GPS_TARGET.search(text)
         return gps_decision(clean_target(match.group('target')) if match else '', text)
@@ -405,7 +420,7 @@ class Middleman:
         with self._lock:
             if epoch != self._epoch and not (decision.stop or decision.mode is Mode.HELP):
                 return None  # a stop or help came in while this was being read
-            if decision.forward and self.on_ack:
+            if decision.forward and not decision.reply and self.on_ack:
                 self.on_ack()  # no spoken reply: perception answers later, so beep to say it was heard
             if decision.mode is None:
                 return decision  # stay in the current mode: speak the reply, or send the text to perception

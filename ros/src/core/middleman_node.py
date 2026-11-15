@@ -22,9 +22,8 @@ the user says "stop", "exit manual mode" or "stop following".
 """
 
 import json
-import re
 
-from middleman import Middleman, Mode, qwen_interpreter
+from middleman import DESCRIBE, Middleman, Mode, qwen_interpreter
 
 # The topic parameters and their defaults. mode_topic and goal_topic are the names perception listens to.
 TOPICS = {
@@ -32,9 +31,6 @@ TOPICS = {
     'heard_topic': '/middleman/heard', 'mode_topic': '/mode', 'goal_topic': '/goal', 'status_topic': '/object_status',
     'description_topic': '/scene_description', 'done_topic': '/middleman/done'}
 
-# The questions perception can answer: it only describes the whole view.
-DESCRIBE = re.compile(r"\b(what's|what is|whats|describe)\b.*\b(in front|ahead|around|happening|room)\b|\bwhat (do|can) you see\b"
-                      r"|\bdescribe\b|\bwhere am i\b|\blook around\b")
 CANNOT_ANSWER = "Sorry, I can only describe what is in front of me."
 
 
@@ -127,7 +123,14 @@ def main():
     node.create_subscription(String, topic['done_topic'], on_done, 10, callback_group=group)
     node.create_subscription(String, topic['status_topic'], on_object_status, 10, callback_group=group)
     node.create_subscription(String, topic['description_topic'], on_description, 10, callback_group=group)
-    node.get_logger().info(f"Middleman ready. Qwen is {'on' if interpreter else 'off'}.")
+    import llm
+    if not interpreter:
+        model = 'off (rules only)'
+    elif llm.cloud_available():
+        model = f'{llm.CLOUD_MODEL}, the local {llm.LOCAL_MODEL} as fallback'
+    else:
+        model = f'the local {llm.LOCAL_MODEL} (no API key)'
+    node.get_logger().info(f'Middleman ready. Language model: {model}.')
     executor = MultiThreadedExecutor(num_threads=4)
     executor.add_node(node)
     try:

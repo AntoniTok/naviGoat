@@ -35,7 +35,7 @@ LOCATION_ALIASES = {
     'alexander fleming building': 'sir alexander fleming building', 'penney': 'william penney laboratory', 'penney lab': 'william penney laboratory',
     '170 queens gate': '170 queen\'s gate', 'library': 'abdus salam library', 'central library': 'abdus salam library', 'abdus salam': 'abdus salam library',
     'salam library': 'abdus salam library', 'abdul salam library': 'abdus salam library', 'abdul salam': 'abdus salam library', 'union': 'imperial college union',
-    'beit quadrangle': 'beit quad', 'ethos': 'ethos sports centre', 'queens tower': "queen's tower",
+    'beit quadrangle': 'beit quad', 'bight quad': 'beit quad', 'bite quad': 'beit quad', 'bait quad': 'beit quad', 'byte quad': 'beit quad', 'beat quad': 'beit quad', 'ethos': 'ethos sports centre', 'queens tower': "queen's tower",
     'pret a manger': 'pret', 'press': 'pret', 'prett': 'pret', 'prit': 'pret',
     'abdu salam library': 'abdus salam library', 'abdu salam': 'abdus salam library'}
 
@@ -73,7 +73,7 @@ OBJECT_ALIASES = {
     'potted plant': 'plant', 'flower pot': 'plant', 'flowers': 'vase',
     'television': 'tv', 'television set': 'tv', 'monitor': 'tv', 'screen': 'tv', 'computer screen': 'tv',
     'computer': 'laptop', 'remote control': 'remote', 'tv remote': 'remote', 'phone': 'cell phone',
-    'mobile phone': 'cell phone', 'mobile': 'cell phone', 'smartphone': 'cell phone', 'earphones': 'headphones',
+    'mobile phone': 'cell phone', 'mobile': 'cell phone', 'smartphone': 'cell phone', 'iphone': 'cell phone', 'earphones': 'headphones',
     'headset': 'headphones', 'cable': 'charger',
     'fridge': 'refrigerator', 'water bottle': 'bottle', 'mug': 'cup', 'glass': 'cup',
     'wine glass': 'cup', 'dish': 'plate',
@@ -96,12 +96,13 @@ OBJECT_FALLBACK_LOCATIONS = {'toilet': 'bathroom', 'door': 'exit', 'refrigerator
 # Whisper hear them where nobody said them. Whisper keeps only the last ~220 tokens of a hint.
 SPEECH_HINT = [
     'Abdus Salam Library', 'Pret', 'Skempton Building', 'Bessemer Building', 'Sherfield Building', 'Huxley Building',
-    'Blackett Laboratory', 'Roderic Hill Building', 'William Penney Laboratory', 'Sir Alexander Fleming Building',
+   'Roderic Hill Building', 'Sir Alexander Fleming Building',
     'Dangoor Plaza', 'Beit Quad', 'Rasa Kitchen', 'Triple E']
 
 
 def speech_prompt():
-    return 'Pete, follow me. Pete, stop. Pete, take me to the ' + ', '.join(SPEECH_HINT) + '.'
+    return ('Pete, follow me. Pete, stop. Pete, where is the bottle, the cup, the keys, the phone, the glasses, the chair? '
+            'Pete, take me to the ' + ', '.join(SPEECH_HINT) + '.')
 
 
 # What a place is for, shown to Qwen next to the name so a need ("I'm hungry", "I have to study") can be matched to a

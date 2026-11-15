@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
-"""When /mode switches to 'description', describes the camera image with Qwen3-VL (through Ollama) on /scene_description."""
+"""When /mode switches to 'description', describes the camera image on /scene_description, with Claude or the local model."""
 
 import base64
-import json
+import os
 import re
+import sys
 import threading
-import time
-import urllib.error
-import urllib.request
 
 import cv2
 import numpy as np
@@ -18,9 +16,10 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import Image
 from std_msgs.msg import String
 
-OLLAMA_URL = 'http://localhost:11434/api/chat'
-VLM_MODEL = 'qwen3-vl:2b-instruct'  # the plain tag is a thinking model, too slow here
-OLLAMA_OPTIONS = {'num_ctx': 4096}  # keep identical on every request, or Ollama reloads the model
+# Claude when there is an API key and a connection, otherwise the small local model: see core/llm.py
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'core'))
+import llm  # noqa: E402
+VLM_MODEL = llm.LOCAL_MODEL
 CAMERA_QOS = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
 
 SYSTEM_PROMPT = """You are Pete, a guide robot for a blind or low-vision person. \
@@ -44,24 +43,9 @@ crossing light, and its colour, if one is actually in the picture; never mention
 - Only describe what you can see. If the image is dark, blurry or blocked, say so plainly."""
 
 
-def ollama_chat(body, timeout=60):
-    headers = {'Content-Type': 'application/json'}
-    request = urllib.request.Request(OLLAMA_URL, json.dumps(body).encode(), headers)
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        return json.load(response)
-
-
 def load_vlm(model):
-    """Load the vision model onto the GPU and keep it there. True if it loaded."""
-    for _ in range(30):  # Ollama may still be starting
-        try:
-            ollama_chat({'model': model, 'messages': [], 'keep_alive': -1, 'options': OLLAMA_OPTIONS}, timeout=300)
-            return True
-        except urllib.error.URLError:
-            time.sleep(1)
-        except TimeoutError:
-            return False
-    return False
+    """Load the local vision model onto the GPU and keep it there. True if it loaded."""
+    return llm.load_local(model)
 
 
 def to_jpeg(image):
@@ -107,13 +91,13 @@ def describe(model, frame):
     sides = ['bottom left', 'bottom right'] if len(parts) == 2 else ['bottom']
     where = ' '.join(f'The {side} part is a close-up of what is {spot}.' for side, (_, spot) in zip(sides, parts))
     prompt = f'Describe what is in front of me. The top part of the picture is the whole view. {where}'
-    messages = [{'role': 'system', 'content': SYSTEM_PROMPT}, {'role': 'user', 'content': prompt, 'images': [to_jpeg(collage(frame, parts))]}]
-    try:
-        response = ollama_chat({'model': model, 'stream': False, 'keep_alive': -1, 'options': {**OLLAMA_OPTIONS, 'num_predict': 90},
-                                'messages': messages}, timeout=90)
-    except (urllib.error.URLError, TimeoutError):
+    image = to_jpeg(collage(frame, parts))
+    answer = llm.ask_cloud(SYSTEM_PROMPT, prompt, image=image)
+    if answer is None:  # no key, offline, or Claude was slow
+        answer = llm.ask_local(SYSTEM_PROMPT, prompt, image=image, max_tokens=90, timeout=90, model=model)
+    if answer is None:
         return 'I cannot reach the vision model.'
-    answer = response.get('message', {}).get('content', '').replace('*', '').replace('#', '').strip()
+    answer = answer.replace('*', '').replace('#', '').strip()
     sentences = re.split(r'(?<=[.!?])\s+', answer)  # keep three sentences
     return ' '.join(sentences[:3]) or 'Sorry, I could not describe the scene.'
 
@@ -134,9 +118,11 @@ class SceneDescription(Node):
         self.create_subscription(Image, param('image_topic', '/camera/color/image_raw'), self.on_image, CAMERA_QOS)
 
         if load_vlm(self.vlm_model):  # before YOLO starts, see the launch file
-            self.get_logger().info(f'Vision model {self.vlm_model} loaded.')
+            self.get_logger().info(f'Local vision model {self.vlm_model} loaded.')
         else:
             self.get_logger().warn('Could not load the vision model. Is Ollama running?')
+        cloud = f'{llm.CLOUD_MODEL} first, the local model as fallback' if llm.cloud_available() else 'no API key, the local model only'
+        self.get_logger().info(f'Descriptions: {cloud}.')
         print('scene_description ready', flush=True)
 
     def on_image(self, msg):

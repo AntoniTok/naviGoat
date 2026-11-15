@@ -2,9 +2,10 @@
 # Connect the AirPods, route audio to them, keep the voice link open and run the listener.
 # Copy to ~/start_voice.sh on the Jetson. Extra arguments go to listen_controller.py, e.g. --no-speak or --qwen.
 #
-# The AirPods' address is set below (or AIRPODS=aa:bb:... ~/start_voice.sh). They must be out of the case, and not
+# The headset's address is set below, now the G21 Pro earphones (or AIRPODS=aa:bb:... ~/start_voice.sh, e.g. the AirPods
+# at E4:76:84:52:6E:61). The variable keeps its old name. The headset must be out of its case, and not
 # connected to a laptop or phone.
-AIRPODS=${AIRPODS:-E4:76:84:52:6E:61}
+AIRPODS=${AIRPODS:-24:DF:17:09:22:83}
 ID=${AIRPODS//:/_}
 SINK=bluez_output.$ID.1
 SRC=bluez_input.$ID.0
@@ -57,7 +58,7 @@ trap 'kill $KEEP 2>/dev/null' EXIT
 
 # 5. Whisper on the GPU if its container is set up, otherwise on the CPU.
 WHISPER=""
-if [ -x ~/start_whisper_gpu.sh ] && [ -d ~/whisper-gpu/site/whisper ] && docker image inspect navigoat:dev >/dev/null 2>&1; then
+if [ -x ~/start_whisper_gpu.sh ] && docker run --rm navigoat:dev python3 -c 'import whisper' >/dev/null 2>&1; then
   ~/start_whisper_gpu.sh && WHISPER="--whisper-url http://127.0.0.1:8765" || echo "GPU server did not start: using the CPU instead"
 fi
 
