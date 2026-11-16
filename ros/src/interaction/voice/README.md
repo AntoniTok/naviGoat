@@ -1,0 +1,136 @@
+# Voice: talk to the robot through AirPods on the Jetson
+
+Listens to a microphone, turns speech into text with Whisper, gives the text to the [middleman](../../core/middleman.py), which decides what to do (follow, go to a place, go to an object, stop, ...), and says the reply out loud. On the Jetson the microphone and speaker are AirPods over Bluetooth.
+
+Say "Pete, follow me", "Pete, take me to the bathroom", "Pete, stop". Phrases without "Pete" are ignored on purpose.
+
+## Every time you log in
+
+1. **Power the Jetson and connect to it** (see [Reaching the Jetson](#reaching-the-jetson)).
+2. **Wake the AirPods.** Take them out of the case and put one in your ear. They must not be connected to a laptop or phone: turn those Bluetooth connections off first.
+3. **Log in:** `ssh navigoat@<jetson-address>`
+4. **Get the latest code** (skip if nothing changed): `cd ~/naviGoat && git pull`. If git says local changes would be overwritten, some files were copied over with `scp` before they were committed: run `git stash`, then `git pull`.
+5. **Start it:** `~/start_voice.sh`. Wait for `Listening. Say 'Pete, ...'`. Ctrl+C stops it. Extra options are passed on, for example `~/start_voice.sh --no-speak` (print only) or `--qwen`.
+6. **Talk.** Each phrase prints what was heard, what the middleman decided, and how long transcription took. The reply is spoken in the AirPod.
+
+```
+heard: Hello Pete, follow me.
+  FOLLOW  target=-  reply="Following."
+  (3.26 s of speech, transcribed in 1.78 s)
+```
+
+Each run saves a `NNN.wav` per phrase and a `log.jsonl` in `~/report/<date_time>/`. Copy them to a laptop with `scp -r navigoat@<jetson-address>:report .`.
+
+### How it decides you have started and finished talking
+
+The listener uses the Silero voice-detection model (the file ships inside `faster-whisper`, and it runs on the CPU in under a millisecond per block). It hears quiet speech, ignores steady noise and taps on the microphone, and keeps a pause between words from ending a phrase. A phrase ends after `--silence` seconds of quiet (0.5 in `start_voice.sh`). If you have said less than `--short-phrase` seconds so far (a bare "Pete,"), it waits `--short-silence` (1.0 s) instead, so the request after the pause stays in the same phrase. The quiet at the end is trimmed before it goes to Whisper. `--vad energy` switches back to the old loudness rule (`--min-rms`). On 53 recorded phrases the old rule missed 4 and the new one heard all of them, and 40 s of noise with taps produced no false phrase.
+
+After a bare "Pete." the listener beeps and accepts the next phrase without the wake word for `--follow-up` seconds (4).
+
+### If something does not work
+
+| What you see | What to do |
+| --- | --- |
+| `Could not connect. Take the AirPods out of the case...` | They are asleep or connected to another device. Wake them, turn Bluetooth off on the laptop and phone, run the script again. `page-timeout` in the error means the same thing. |
+| `The AirPods are connected but have no audio device` | The one-time fixes in step 4 of [Setting up a Jetson from scratch](#setting-up-a-jetson-from-scratch) are missing, or the login screen's audio is back. |
+| It prints `Listening` but never hears you | The microphone is silent unless something is playing to the AirPods. The script plays silence for that. Check `pgrep -f 'paplay.*zero'` and that the AirPods are still connected. |
+| Words are wrong | See [Quality](#what-to-know-about-bluetooth-headphones-as-the-microphone). Say short, clear commands starting with "Pete". |
+| It talks to itself | The microphone is ignored while the robot speaks and for half a second after, but a long echo can still get through. Lower the speaker volume. |
+
+## Running as ROS nodes in the container
+
+`start_voice.sh` runs everything as one Python program on the host, with no ROS. To connect the voice to the rest of the robot, the same code also runs as ROS nodes in a container, next to Flavio's perception, which talks through topics:
+
+```
+host:      AirPods (Bluetooth, PipeWire)   connect_airpods.sh
+                 │ the sound socket, mounted into the container
+container: voice.py  ──/speech/text──▶  middleman_node.py  ──/goal, /mode──▶  perception
+           (speaks /pete/response)  ◀──/pete/response, /scene_description, /object_status──
+other containers: Whisper (GPU), Ollama (Qwen), perception
+```
+
+- The team's [Dockerfile.dev](../../../../docker/Dockerfile.dev) has a `VOICE` option, like `PETE`, that adds the audio libraries and the speech packages to `navigoat:dev`: `docker build -f docker/Dockerfile.dev --build-arg PETE=true --build-arg VOICE=true -t navigoat:dev .` (add `PETE=true` too on the Jetson, because the same image runs perception, Whisper and Qwen).
+- [connect_airpods.sh](connect_airpods.sh) stays on the host, because Bluetooth and the sound system belong to it. [start_voice_ros.sh](start_voice_ros.sh) runs it, starts Whisper and Ollama, then starts the voice container with the host's sound socket mounted (`-v /run/user/1000/pulse:/run/user/1000/pulse -e PULSE_SERVER=unix:/run/user/1000/pulse/native`).
+- [launch/voice.launch.py](launch/voice.launch.py) starts `voice.py` and the middleman, like `perception.launch.py`: `ros2 launch /workspace/ros/src/interaction/voice/launch/voice.launch.py use_qwen:=true whisper_url:=http://127.0.0.1:8765`. `listen:=false` starts it without a microphone, for tests.
+- The settings are ROS parameters (`device`, `output_device`, `model`, `voice`, `speed`, `whisper_url`, `text_topic`, `follow_up`, `min_rms`, `silence`, ...), the command line works without ROS (`python3 voice.py --terminal`). The middleman's topics are in [core/README.md](../../core/README.md).
+- The folders are also ROS packages (`voice_nodes` and `middleman`, with a `package.xml` and `setup.py`), so `colcon build` and a `bringup` launch file can include them.
+
+## Reaching the Jetson
+
+- **USB-C cable, `192.168.55.1`.** The simplest, but the link has dropped and SSH sometimes times out ("banner exchange" or "connection timed out"). Use a USB 3 data cable in the Jetson's USB-C device port. Retrying, or keeping one session open instead of many short ones, helps.
+- **Phone hotspot (more stable).** Put the laptop and the Jetson on the same hotspot. The Jetson remembers the network once it has joined it (`nmcli device wifi connect "<name>" password "<password>"`, with `sudo`). Find its address on the phone's list of connected devices, or run `hostname -I` on the Jetson. On an iPhone, turn on Maximize Compatibility and keep the hotspot screen open until both devices have joined.
+- The campus Wi-Fi does not work: it normally stops devices from seeing each other.
+- **After a re-flash** the Jetson has a new SSH key and your laptop warns "REMOTE HOST IDENTIFICATION HAS CHANGED". If you know it was re-flashed, run `ssh-keygen -R <address>` and connect again.
+
+## Files
+
+| File | What it does |
+| --- | --- |
+| [start_voice.sh](start_voice.sh) | Goes in the Jetson's home folder as `~/start_voice.sh`. Connects the AirPods (3 tries), waits for their speaker and microphone, sets them as the default sound devices, keeps the microphone alive, then runs `listen_controller.py` with recording on |
+| [listen_controller.py](listen_controller.py) | Microphone, Whisper, the middleman, then speaks the reply. No ROS. Records every phrase and logs it with `--save-dir` |
+| [voice.py](voice.py) | The pieces the others use (microphone capture, Whisper, speaking), and the ROS version: publishes the text on `/speech/text` and speaks `/pete/response` |
+| [connect_airpods.sh](connect_airpods.sh), [start_voice_ros.sh](start_voice_ros.sh), [launch/voice.launch.py](launch/voice.launch.py) | The container version, see [Running as ROS nodes in the container](#running-as-ros-nodes-in-the-container) |
+| [whisper_server.py](whisper_server.py), [start_whisper_gpu.sh](start_whisper_gpu.sh) | Whisper on the GPU, as a small local server in the `navigoat:people-dev` container. Not set up on the current Jetson, see [Whisper on the GPU](#whisper-on-the-gpu) |
+
+Whisper is given a hint (`initial_prompt`) with the unusual place names from [core/catalog.py](../../core/catalog.py), so it spells "Beit Quad" and "Pret" right. The ROS version also listens to `/navigation/places` (the places saved by voice, latched) and adds those names to the hint, up to the last 20, so a saved name like "balcony" is spelled right too. `listen_controller.py` uses the catalog's hint only.
+
+`start_voice.sh` and `connect_airpods.sh` contain the Bluetooth address of the G21 Pro earphones (`24:DF:17:09:22:83`), which have a microphone and the headset profile. For other headphones, such as the AirPods (`E4:76:84:52:6E:61`), run `AIRPODS=aa:bb:cc:dd:ee:ff ~/start_voice.sh` or `AIRPODS=aa:bb:cc:dd:ee:ff ~/start_voice_ros.sh`. To pair new ones once: put them in pairing mode, then `bluetoothctl scan on`, `pair <address>`, `trust <address>` and `connect <address>`.
+
+## Setting up a Jetson from scratch
+
+Done on the current Jetson (Ubuntu 24.04, BlueZ 5.72, PipeWire 1.0.5, WirePlumber 0.4.17), which was re-flashed. Do this on the Jetson itself or over SSH.
+
+**1. Packages.**
+```bash
+sudo apt-get install -y pulseaudio-utils libportaudio2 libasound2-plugins espeak-ng python3-venv
+python3 -m venv --system-site-packages ~/voice-env
+~/voice-env/bin/pip install "numpy<2" sounddevice faster-whisper pyttsx3
+```
+`pulseaudio-utils` only provides `pactl` and `paplay`. The sound server is PipeWire. The first start downloads Whisper `base.en` (about 140 MB).
+
+**2. Bluetooth classic mode.** In `/etc/bluetooth/main.conf`, change `#ControllerMode = dual` to `ControllerMode = bredr`, **with the `#` removed**, then `sudo systemctl restart bluetooth`. Check with `grep ControllerMode /etc/bluetooth/main.conf`. Without it AirPods Pro fail to pair (`AuthenticationRejected`). It is a system-wide Bluetooth setting.
+
+**3. Pair the AirPods.** Put them in pairing mode (case lid open, hold the back button until the light flashes white). In `bluetoothctl`: `agent NoInputNoOutput`, `default-agent`, `scan on`, then `pair`, `trust`, `connect` with the address that shows as `AirPods Pro`. Pair the moment it appears: BlueZ forgets an unpaired device a few seconds after it stops advertising, and `pair` then answers "Device not available" until it advertises again. An entry ending in "Find My" is Apple's tracking broadcast and cannot be paired.
+
+**4. Bluetooth audio and the login screen.** Two things stop PipeWire from creating the AirPods' speaker and microphone when you are only logged in over SSH. Both are one-time fixes:
+
+- WirePlumber only serves Bluetooth audio to the user logged in on the Jetson's own screen (`with-logind = true`). Copy the default and turn it off for this user:
+  ```bash
+  mkdir -p ~/.config/wireplumber/bluetooth.lua.d
+  cp /usr/share/wireplumber/bluetooth.lua.d/50-bluez-config.lua ~/.config/wireplumber/bluetooth.lua.d/
+  sed -i 's/\["with-logind"\] = true,/["with-logind"] = false,/' ~/.config/wireplumber/bluetooth.lua.d/50-bluez-config.lua
+  systemctl --user restart wireplumber
+  ```
+- The login screen (gdm) runs its own PipeWire and takes Bluetooth audio first. The registration then fails for your user with `RegisterProfile() failed: org.bluez.Error.NotPermitted`. Switch off PipeWire for the `gdm` user only. The login screen still works, it just has no sound, so a monitor can still be used to log in:
+  ```bash
+  D=/var/lib/gdm3/.config/systemd/user
+  sudo mkdir -p $D
+  for u in pipewire.service pipewire.socket wireplumber.service pipewire-pulse.service pipewire-pulse.socket; do sudo ln -sf /dev/null $D/$u; done
+  sudo chown -R gdm:gdm /var/lib/gdm3/.config
+  sudo systemctl restart gdm
+  ```
+  To undo, delete those five links. Check with `ps -eo user,comm | grep -E 'wireplumber|pipewire'`: only your user should be listed. `start_voice.sh` also handles this if the login screen's audio is back, by stopping gdm (it asks for the sudo password).
+
+Restarting `bluetooth` makes PipeWire lose its registration, so run `systemctl --user restart wireplumber` and reconnect the AirPods afterwards.
+
+**5. Copy `start_voice.sh`** to `~/start_voice.sh` and `chmod +x` it.
+
+## What to know about Bluetooth headphones as the microphone
+
+- **The microphone only works while something is playing to the headphones.** With the headset profile active and nothing playing, the source delivers pure silence. `start_voice.sh` plays silence (`paplay ... /dev/zero`) to keep it alive. This was found by testing, and the cause was not diagnosed.
+- **Quality is phone-call level.** The headset profile is 8 kHz mono and the AirPods offer no better profile for the microphone. In testing, many phrases were mis-heard ("Pete, you probably forgot to do technically much"). Accuracy was not measured on a test set, so there is no error rate. A wired or USB microphone is much better.
+- **Volumes.** The mic starts low, so the script sets it to 100% and the listener's threshold to `--min-rms 0.006`. The speaker is set to 40%.
+- **The AirPods disconnect** when they go back in the case or sit idle. Wake them and run `start_voice.sh` again.
+- **The voice is a Piper neural voice** (`en_GB-northern_english_male-medium`), installed in the image by the `VOICE` option of `Dockerfile.dev`. A listener that cannot load it ("Piper voice ... not available" at start) falls back to the robotic `espeak-ng` system voice, played through PipeWire with `paplay`. Another Piper voice, or a Kokoro voice, is chosen with `--voice`; `--speed` changes how fast it speaks.
+- BlueZ logs show warnings (`already registered`, `RFCOMM receive command but modem not available`). The setup works despite them.
+
+## Whisper on the GPU
+
+The code first ran Whisper on the CPU through `faster-whisper`. Its ARM build from pip has no CUDA, so on the current Jetson it runs on the CPU: about 1.6 to 2.8 s per phrase of 2 to 4 s with `base.en`, plus the 0.8 s of silence the listener waits for (`--silence`). The GPU server (`whisper_server.py`, started by `start_whisper_gpu.sh` in the `navigoat:dev` container with OpenAI's `openai-whisper`) measured 0.17 to 0.45 s with `base.en` and 0.15 to 0.24 s with `tiny.en`. `openai-whisper`, its few dependencies and the `base.en` weights are installed in the image by the `VOICE` option of `docker/Dockerfile.dev`, so nothing is installed by hand on the Jetson. If the server cannot start, the listener uses the CPU.
+
+## Not done yet
+
+- **A reboot has not been tested** with the login-screen fix. If `start_voice.sh` asks for a password after a reboot, the login screen's audio came back.
+- **The container version has not been run on the Jetson yet.** It was built and tested on a laptop with real ROS 2 (build, launch, parameters, topics) but without a microphone. Not tested: the AirPods through the mounted sound socket, the Silero model and the speech voice inside the container, and everything fitting in the 8 GB together with perception.
+- **Nothing acts on the decisions yet.** "Following." is only said; no follow or navigation node reads `/middleman/mode`.
+- **GPU Whisper together with Pete's models** (Qwen and YOLO) is untested. They share the 8 GB of the Orin Nano, so a smaller Whisper model may be needed.

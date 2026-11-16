@@ -109,7 +109,7 @@ controller_server:
       wz_std: 0.4
       vx_max: 1.5
       vx_min: -0.4
-      vy_max: 0.5
+      vy_max: 1.5
       wz_max: 1.9
       iteration_count: 1
       prune_distance: 1.7
@@ -198,7 +198,21 @@ local_costmap:
       height: 3
       resolution: 0.05
       footprint: "[[0.30, 0.26], [0.30, -0.26], [-0.30, -0.26], [-0.30, 0.26]]"
-      plugins: ["voxel_layer", "inflation_layer"]
+      plugins: ["voxel_layer", "social_layer", "inflation_layer"]
+      social_layer:  # the people from people_node.py and the social rules: see autonomy/navigation/README.md
+        plugin: "social_layer::SocialLayer"
+        people_topic: /people
+        person_radius: 0.3          # m, lethal: the person themselves (the inflation layer adds the robot's size)
+        personal_space: 1.0         # m, where a person's cost has faded to 0
+        personal_space_cost: 150    # cost just outside person_radius. Under 253, so it is avoided but never blocks
+        motion_stretch: 1.0         # m more personal space ahead of someone walking, per m/s
+        group_distance: 2.2         # m, two people closer than this are together. Below ~1.9 m personal space alone
+                                    # already keeps the robot out of the gap, so this rule matters from ~1.9 m to here
+        group_cost: 220             # cost of the strip between two people together: go around them if possible
+        ignore_radius: 0.6          # m, people this close to the robot are left out (the person holding the handle)
+        prediction_time: 2.0        # s, how far ahead a walker's path is predicted (0 switches that rule off)
+        prediction_width: 1.0       # m, width of the predicted path
+        prediction_cost: 200        # cost right in front of a walker, fading to 0 at the end of their predicted path
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         cost_scaling_factor: 3.0
@@ -214,7 +228,7 @@ local_costmap:
         mark_threshold: 0
         observation_sources: lidar
         lidar:
-          topic: /lidar/points
+          topic: /unilidar/cloud
           max_obstacle_height: 2.0
           clearing: True
           marking: True
@@ -239,13 +253,27 @@ global_costmap:
       footprint: "[[0.30, 0.26], [0.30, -0.26], [-0.30, -0.26], [-0.30, 0.26]]"
       resolution: 0.05
       track_unknown_space: true
-      plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
+      plugins: ["static_layer", "obstacle_layer", "social_layer", "inflation_layer"]
+      social_layer:  # the people from people_node.py and the social rules: see autonomy/navigation/README.md
+        plugin: "social_layer::SocialLayer"
+        people_topic: /people
+        person_radius: 0.3          # m, lethal: the person themselves (the inflation layer adds the robot's size)
+        personal_space: 1.0         # m, where a person's cost has faded to 0
+        personal_space_cost: 150    # cost just outside person_radius. Under 253, so it is avoided but never blocks
+        motion_stretch: 1.0         # m more personal space ahead of someone walking, per m/s
+        group_distance: 2.2         # m, two people closer than this are together. Below ~1.9 m personal space alone
+                                    # already keeps the robot out of the gap, so this rule matters from ~1.9 m to here
+        group_cost: 220             # cost of the strip between two people together: go around them if possible
+        ignore_radius: 0.6          # m, people this close to the robot are left out (the person holding the handle)
+        prediction_time: 2.0        # s, how far ahead a walker's path is predicted (0 switches that rule off)
+        prediction_width: 1.0       # m, width of the predicted path
+        prediction_cost: 200        # cost right in front of a walker, fading to 0 at the end of their predicted path
       obstacle_layer:
         plugin: "nav2_costmap_2d::ObstacleLayer"
         enabled: False
         observation_sources: lidar
         lidar:
-          topic: /lidar/points
+          topic: /unilidar/cloud
           max_obstacle_height: 2.0
           clearing: True
           marking: True
@@ -400,7 +428,7 @@ collision_monitor:
     observation_sources: ["lidar"]
     lidar:
       type: "pointcloud"
-      topic: "/lidar/points"
+      topic: "/unilidar/cloud"
       min_height: 0.15
       max_height: 2.0
       enabled: True

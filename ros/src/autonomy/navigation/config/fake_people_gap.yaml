@@ -1,0 +1,14 @@
+# A social test: two people talking 2.0 m apart, at (0.5, -1.5) and (0.5, -3.5), across the line y = -2.5. The gap
+# between them is wide enough for the robot, and with the group rule off it drives straight through it. With the
+# group rule on (the default) it should go around them instead, about 1.2 m longer.
+#
+#   ros2 launch .../navigation_sim.launch.py fake_people:=$PWD/ros/src/autonomy/navigation/config/fake_people_gap.yaml
+#   ros2 topic pub --once /navigation/goto_point geometry_msgs/msg/PointStamped "{header: {frame_id: map}, point: {x: -3.0, y: -2.5}}"
+#   ros2 topic pub --once /navigation/goto_point geometry_msgs/msg/PointStamped "{header: {frame_id: map}, point: {x: 4.0, y: -2.5}}"
+#
+# To compare, switch the group rule off (0) or back on (220) in both costmaps, then send the robot again:
+#   ros2 param set /global_costmap/global_costmap social_layer.group_cost 0
+#   ros2 param set /local_costmap/local_costmap social_layer.group_cost 0
+people:
+  - {x: 0.5, y: -1.5}
+  - {x: 0.5, y: -3.5}

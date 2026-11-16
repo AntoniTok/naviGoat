@@ -1,0 +1,12 @@
+# Made-up people for testing the social layer in Gazebo, read by people_node.py (launch argument fake_people:=<this file>).
+# Map coordinates in metres. These suit the indoor world: a 10 x 10 m room with a box at (2, 1), the robot starting at
+# (0, 0) facing +x, and so a map whose frame matches the world's. On another map, put them where there is room.
+#   standing:  {x: .., y: ..}
+#   walking:   {from: [x, y], to: [x, y], speed: m/s}   back and forth between the two points
+people:
+  # Two people talking, 1.2 m apart, right on the way to (4, -2). The gap between them is too narrow for the robot
+  # anyway: for a gap it fits through, see fake_people_gap.yaml.
+  - {x: 2.5, y: -1.0}
+  - {x: 2.5, y: -2.2}
+  # Someone walking up and down the room: the robot should not cut in front of them.
+  - {from: [1.0, -4.0], to: [1.0, 3.5], speed: 0.6}

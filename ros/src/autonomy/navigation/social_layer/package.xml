@@ -1,0 +1,19 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>social_layer</name>
+  <version>0.0.1</version>
+  <description>Nav2 costmap layer: the people around the robot as obstacles, with social rules between them</description>
+  <maintainer email="nihil@users.noreply.github.com">nihil</maintainer>
+  <license>Proprietary</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <depend>nav2_costmap_2d</depend>
+  <depend>navigoat_msgs</depend>
+  <depend>pluginlib</depend>
+  <depend>rclcpp</depend>
+  <depend>tf2_ros</depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

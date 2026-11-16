@@ -1,0 +1,271 @@
+"""Keeps the people around the robot on the map, for the social layer in Nav2's costmaps (social_layer/).
+Started by launch/navigation.launch.py. Its topics are listed in autonomy/navigation/README.md.
+
+People come from three places, and are all published together on /people, 10 times a second:
+  - Enid's tracker: positions relative to the camera, put on the map with where the camera was when the image was
+    taken. A person's speed comes from how they moved on the map over the last second, so the robot turning doesn't
+    make standing people look like they walk. Someone standing is remembered for remember_for seconds after the camera
+    loses them (the robot may only have turned away), someone walking for track_timeout seconds.
+  - RViz's "Publish Point" tool: a click adds a standing person, a click on one removes them.
+  - fake_people, a YAML file of made-up people for testing (see ../config/fake_people.yaml): standing people, and
+    people walking back and forth between two points.
+
+    python3 people_node.py --ros-args -p use_sim_time:=true -p fake_people:=../config/fake_people.yaml
+"""
+
+# this node collects all the people we know about and puts them on the map, so the social layer (in the costmaps)
+# can keep the robot away from them. it doesn't detect anyone itself: it just takes coordinates from the tracker,
+# from RViz clicks and from the fake people file.
+
+import collections  # for deque, a list that is quick to remove things from the front
+import json  # Enid's tracker sends JSON inside a String
+import math
+import signal  # only used at the very end, to stop cleanly
+
+import numpy as np  # for the line fit that gives the walking speed
+import rclpy
+import yaml  # the fake people file
+from geometry_msgs.msg import Point, PointStamped
+from navigoat_msgs.msg import People, Person  # our own messages, see navigoat_msgs/msg/
+from rclpy.node import Node
+from rclpy.time import Time
+from std_msgs.msg import String
+from tf2_geometry_msgs import do_transform_point  # moves a point from one frame into another
+from tf2_ros import Buffer, TransformException, TransformListener
+from visualization_msgs.msg import Marker, MarkerArray  # the cylinders and arrows we draw in RViz
+
+# a person counts as walking if they move faster than this, otherwise they're standing
+WALKING = 0.25  # m/s: anyone slower is standing (the same as the social layer's min_speed)
+
+
+class Track:
+    """One person from the tracker: where they were on the map over the last second."""
+
+    def __init__(self):
+        # we use the deque as a sliding window: the last 1 s of positions of this person
+        self.history = collections.deque()  # (stamp, x, y), stamp = when the image was taken, in seconds
+        self.last_seen = 0.0  # when we last got them, in seconds
+
+    def add(self, stamp, x, y, now):
+        self.history.append((stamp, x, y))
+        # throw away the positions older than 1 s
+        while stamp - self.history[0][0] > 1.0:
+            self.history.popleft()
+        self.last_seen = now
+
+    def position(self):
+        # where they were the last time we saw them
+        return self.history[-1][1], self.history[-1][2]
+
+    def velocity(self):
+        """(vx, vy) in m/s: the slope of the best-fitting line through the last second. 0 until there is half a second."""
+        # split the history into 3 arrays: the times, the x's and the y's
+        t, x, y = (np.array(column) for column in zip(*self.history))
+        # with too little data the speed would just be noise, so we say they're standing
+        if len(t) < 3 or t[-1] - t[0] < 0.5:
+            return 0.0, 0.0
+        t = t - t[0]  # start the times at 0 (the real timestamps are huge numbers, which the line fit doesn't like)
+        # fit a straight line through x over time: its slope is the speed along x. same thing for y.
+        # a line through all the points is less noisy than just (last position - first position) / time
+        return float(np.polyfit(t, x, 1)[0]), float(np.polyfit(t, y, 1)[0])
+
+
+def load_fake_people(path):
+    """The standing [(x, y)] and walking [(start, end, speed)] people in a YAML file. Nothing if path is '' or 'none'."""
+    # no file given: no fake people
+    if path in ('', 'none'):
+        return [], []
+    with open(path) as f:
+        people = (yaml.safe_load(f) or {}).get('people') or []
+    # someone with x and y stands still, someone with from and to walks between the two points
+    standing = [(p['x'], p['y']) for p in people if 'x' in p]
+    walking = [(p['from'], p['to'], p.get('speed', 1.0)) for p in people if 'from' in p]
+    return standing, walking
+
+
+def walker_at(start, end, speed, t):
+    """Where someone walking back and forth between start and end is after t seconds, and their velocity."""
+    # the line they walk on, and its length
+    dx, dy = end[0] - start[0], end[1] - start[1]
+    length = math.hypot(dx, dy)
+    if length == 0 or speed <= 0:
+        return start, (0.0, 0.0)  # not really walking
+    # one trip there and back is 2 * length, so % tells us how far into the current trip they are
+    s = (t * speed) % (2 * length)  # distance walked since the last time at start
+    direction = 1.0
+    if s > length:  # on the way back
+        s = 2 * length - s  # how far from start they are, coming back
+        direction = -1.0
+    ux, uy = dx / length, dy / length  # the direction of the line, as a vector of length 1
+    return (start[0] + ux * s, start[1] + uy * s), (direction * speed * ux, direction * speed * uy)
+
+
+class PeopleNode(Node):
+    def __init__(self):
+        super().__init__('people')
+        # parameters (see the README)
+        self.map_frame = self.declare_parameter('map_frame', 'map').value
+        self.camera_frame = self.declare_parameter('camera_frame', 'camera_link').value  # the tracker's x forward, y left
+        self.track_timeout = self.declare_parameter('track_timeout', 0.5).value  # s: then a walker we lost is dropped
+        self.remember_for = self.declare_parameter('remember_for', 3.0).value  # s: how long standing people are kept
+        self.standing, self.walking = load_fake_people(self.declare_parameter('fake_people', 'none').value)
+
+        self.tracks = {}  # tracker id -> Track
+        self.clicked = {}  # id (negative) -> (x, y), the people added in RViz
+        self.start = self.seconds()  # the fake walkers start walking when the node starts
+
+        # TF, to move the tracker's points from the camera's frame to the map (see places_node for more)
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
+        # what we send: the people for the social layer, and the markers for RViz
+        self.people_pub = self.create_publisher(People, '/people', 10)
+        self.markers_pub = self.create_publisher(MarkerArray, '/navigation/people_markers', 10)
+        # what we listen to: Enid's tracker, and clicks in RViz
+        self.create_subscription(String, '/social_perception/tracks', self.on_tracks, 10)
+        self.create_subscription(PointStamped, '/clicked_point', self.on_click, 10)
+        # publish everyone 10 times a second (every 0.1 s)
+        self.create_timer(0.1, self.publish)
+        self.get_logger().info(f'People ready: {len(self.standing)} standing and {len(self.walking)} walking fake '
+                               'people. Click in RViz with "Publish Point" to add or remove one.')
+
+    def seconds(self):
+        # the time now, in seconds (in Gazebo this is the simulation's time)
+        return self.get_clock().now().nanoseconds / 1e9
+
+    def transform_to_map(self, frame, stamp):
+        """TF's transform from frame to the map at that time, or the latest one if TF doesn't have that time."""
+        # if TF doesn't have that exact time, we just use the latest one
+        if not self.tf_buffer.can_transform(self.map_frame, frame, stamp):
+            stamp = Time()  # the latest
+        try:
+            return self.tf_buffer.lookup_transform(self.map_frame, frame, stamp)
+        except TransformException as e:
+            # throttle_duration_sec: print this at most once every 5 s, so it doesn't flood the terminal
+            self.get_logger().warning(f'Cannot place people from {frame} on the map: {e}', throttle_duration_sec=5.0)
+            return None
+
+    def on_tracks(self, msg):
+        """Enid's tracker: {"stamp_sec": ..., "tracks": [{"id", "x", "y", "confirmed"}]}, x forward and y left of the
+        camera, in metres."""
+        # turn the JSON text into a dict. if it's broken, we just ignore that message
+        try:
+            data = json.loads(msg.data)
+        except ValueError:
+            return
+        now = self.seconds()
+        stamp = data.get('stamp_sec') or now  # when the image was taken (or now, if the tracker didn't say)
+        # where the camera was when it took the image. that matters when the robot is turning: by the time the
+        # tracker is done the camera already looks somewhere else
+        transform = self.transform_to_map(self.camera_frame, Time(seconds=stamp))
+        if transform is None:
+            return
+        for track in data.get('tracks', []):
+            # the tracker also has people it isn't sure about yet: we skip those
+            if not track.get('confirmed', True):
+                continue
+            # the person relative to the camera -> the same point on the map
+            point = PointStamped()
+            point.point.x, point.point.y = float(track['x']), float(track['y'])
+            p = do_transform_point(point, transform).point
+            # add it to that person's history. setdefault makes a new Track the first time we see that id
+            self.tracks.setdefault(track['id'], Track()).add(stamp, p.x, p.y, now)
+
+    def on_click(self, msg):
+        """RViz's Publish Point: add a standing person there, or remove the clicked person within 0.5 m."""
+        # RViz clicks are usually already in the map frame, but we transform anyway in case they aren't
+        transform = self.transform_to_map(msg.header.frame_id or self.map_frame, Time())
+        if transform is None:
+            return
+        p = do_transform_point(msg, transform).point
+        # is there already a clicked person within 0.5 m of the click?
+        near = [i for i, (x, y) in self.clicked.items() if math.hypot(x - p.x, y - p.y) < 0.5]
+        if near:
+            # yes: clicking on someone removes them
+            del self.clicked[near[0]]
+            self.get_logger().info(f'Removed the person at ({p.x:.1f}, {p.y:.1f}).')
+        else:
+            # no: add a standing person there. clicked people get the ids -1, -2, -3... so they can never be the
+            # same as the tracker's ids (which start at 0)
+            self.clicked[min(self.clicked, default=0) - 1] = (p.x, p.y)
+            self.get_logger().info(f'Added a person at ({p.x:.1f}, {p.y:.1f}).')
+
+    def everyone(self):
+        """[(id, x, y, vx, vy)]: the tracked people (forgetting those not seen for too long), then the fake ones.
+        Fake people have negative ids."""
+        now = self.seconds()
+        people = []
+        # the people from the tracker. list() makes a copy, because we delete from the dict inside the loop
+        for i, track in list(self.tracks.items()):
+            vx, vy = track.velocity()
+            walking = math.hypot(vx, vy) >= WALKING
+            age = now - track.last_seen  # how long since we last saw them
+            # walkers are forgotten quickly (they walk away), standing people slowly (we probably just looked away)
+            if age > (self.track_timeout if walking else self.remember_for):
+                del self.tracks[i]
+            elif age > self.track_timeout:
+                people.append((i, *track.position(), 0.0, 0.0))  # not seen lately: kept where they stood
+            else:
+                people.append((i, *track.position(), vx, vy))  # seen just now: where they are and how they walk
+        # the fake people from the yaml file, with the ids -1000, -1001...
+        fake_id = -1000
+        for x, y in self.standing:
+            people.append((fake_id, x, y, 0.0, 0.0))
+            fake_id -= 1
+        for start, end, speed in self.walking:
+            # where each walker is now, from how long the node has been running
+            (x, y), (vx, vy) = walker_at(start, end, speed, now - self.start)
+            people.append((fake_id, x, y, vx, vy))
+            fake_id -= 1
+        # and the people clicked in RViz, standing still
+        people += [(i, x, y, 0.0, 0.0) for i, (x, y) in self.clicked.items()]
+        return people
+
+    def publish(self):
+        # the message for the social layer: everyone, in the map frame, with the time now
+        msg = People()
+        msg.header.frame_id = self.map_frame
+        msg.header.stamp = self.get_clock().now().to_msg()
+        # For RViz: a cylinder per person, blue if tracked and purple if fake, and an arrow to where a walker will be
+        # in 1 s.
+        markers = MarkerArray(markers=[Marker(action=Marker.DELETEALL)])  # first clear the old markers
+        for k, (i, x, y, vx, vy) in enumerate(self.everyone()):
+            # the person, for the message
+            person = Person(id=i)
+            person.position.x, person.position.y = float(x), float(y)
+            person.velocity.x, person.velocity.y = float(vx), float(vy)
+            msg.people.append(person)
+
+            # a cylinder about the size of a person (0.5 m wide and 1.7 m tall, so its middle is 0.85 m up)
+            body = Marker(type=Marker.CYLINDER, ns='people', id=2 * k)
+            body.pose.position.x, body.pose.position.y, body.pose.position.z = float(x), float(y), 0.85
+            body.scale.x, body.scale.y, body.scale.z = 0.5, 0.5, 1.7
+            body.color.r, body.color.g, body.color.b, body.color.a = (0.7, 0.3, 0.9, 0.8) if i < 0 else (0.2, 0.5, 1.0, 0.8)
+            markers.markers.append(body)
+            # walkers also get an arrow from them to where they'll be in 1 s (position + velocity * 1 s)
+            if math.hypot(vx, vy) >= WALKING:
+                arrow = Marker(type=Marker.ARROW, ns='people', id=2 * k + 1, color=body.color)
+                arrow.points = [Point(x=float(x), y=float(y), z=1.0), Point(x=float(x + vx), y=float(y + vy), z=1.0)]
+                arrow.scale.x, arrow.scale.y, arrow.scale.z = 0.06, 0.15, 0.2
+                markers.markers.append(arrow)
+        # every marker is in the map frame, and needs a valid rotation (w = 1 means "not rotated")
+        for m in markers.markers:
+            m.header.frame_id = self.map_frame
+            m.pose.orientation.w = 1.0
+        self.people_pub.publish(msg)
+        self.markers_pub.publish(markers)
+
+
+def main():
+    rclpy.init()  # start ROS in this program
+    node = PeopleNode()
+    try:
+        rclpy.spin(node)  # keeps the node running, and calls our functions when messages and the timer come
+    except BaseException:  # Ctrl+C, the launch file stopping us, or a real error
+        signal.signal(signal.SIGINT, signal.SIG_IGN)  # ros2 launch sends Ctrl+C a second time: ignore it
+        if rclpy.ok():  # ROS is still running, so this is a real error: show it
+            raise
+
+
+# this runs main() when the file is started with: python3 people_node.py
+if __name__ == '__main__':
+    main()

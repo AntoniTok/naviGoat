@@ -6,19 +6,56 @@ FROM ros:jazzy-perception-noble AS base-arm64
 
 FROM ${BASE_IMAGE}
 
-RUN apt-get update && apt-get install -y -o Acquire::http::Pipeline-Depth=0 --no-install-recommends neovim tree ros-jazzy-rviz2 ros-jazzy-rtabmap-ros python3-pip python3-numpy && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y -o Acquire::http::Pipeline-Depth=0 --no-install-recommends neovim tree ros-jazzy-rviz2 ros-jazzy-rtabmap-ros ros-jazzy-teleop-twist-keyboard python3-pip python3-numpy python3-serial python3-bleak && rm -rf /var/lib/apt/lists/*
 RUN python3 -m pip install --break-system-packages dynamic-object-removal==0.6.0
 
 ARG PETE=false
-ENV PETE_YOLO_MODEL=/opt/models/yolov8s-worldv2.pt OLLAMA_MODELS=/opt/models/ollama
+ENV PETE_YOLO_MODEL=/opt/models/yolov8s-worldv2.pt OLLAMA_MODELS=/opt/models/ollama NVIDIA_DRIVER_CAPABILITIES=all
+# Femto Bolt depth runs on the GPU through EGL and OpenGL, hence libegl1, libgl1 and the NVIDIA EGL vendor file
 RUN if [ "$PETE" = "true" ]; then \
-        apt-get update && apt-get install -y --no-install-recommends python3-pip git curl zstd && rm -rf /var/lib/apt/lists/* && \
+        apt-get update && apt-get install -y --no-install-recommends python3-pip git curl zstd libegl1 libgl1 && rm -rf /var/lib/apt/lists/* && \
         curl -fsSL https://ollama.com/install.sh | sh && \
         (ollama serve > /dev/null 2>&1 &) && sleep 5 && ollama pull qwen3-vl:2b-instruct && \
         pip install --no-cache-dir --break-system-packages --ignore-installed "numpy<2" ultralytics git+https://github.com/ultralytics/CLIP.git && \
+        pip install --no-cache-dir --break-system-packages --no-deps pyorbbecsdk2 && \
+        mkdir -p /usr/share/glvnd/egl_vendor.d && printf '{"file_format_version":"1.0.0","ICD":{"library_path":"libEGL_nvidia.so.0"}}' > /usr/share/glvnd/egl_vendor.d/10_nvidia.json && \
         yolo settings weights_dir=/opt/models/weights && \
         mkdir -p /opt/models && cd /opt/models && python3 -c "from ultralytics import YOLOWorld; YOLOWorld('yolov8s-worldv2.pt').set_classes(['chair'])"; \
     fi
+
+ARG VOICE=false
+# The voice nodes (ros/src/interaction/voice) need the audio libraries and the speech packages. The microphone and the speaker
+# are not in the container: they come from the host's sound system (PipeWire) through a mounted socket, see start_voice_ros.sh.
+# numpy stays below 2: the ROS packages (cv_bridge) are built against numpy 1. faster-whisper brings onnxruntime and the Silero
+# voice-detection model, and runs Whisper on the CPU if the GPU server is missing.
+# The robot speaks with a Piper neural voice (the default of voice.py, looked for in ~/.cache/piper); without it the listener
+# falls back to the robotic espeak-ng voice, which is why espeak-ng stays installed.
+RUN if [ "$VOICE" = "true" ]; then \
+        apt-get update && apt-get install -y --no-install-recommends libportaudio2 libasound2-plugins pulseaudio-utils espeak-ng curl ca-certificates && rm -rf /var/lib/apt/lists/* && \
+        python3 -m pip install --no-cache-dir --break-system-packages "numpy<2" sounddevice faster-whisper piper-tts && \
+        mkdir -p /root/.cache/piper && cd /root/.cache/piper && \
+        for file in en_GB-northern_english_male-medium.onnx en_GB-northern_english_male-medium.onnx.json; do \
+            curl -fsSL -o $file https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_GB/northern_english_male/medium/$file; \
+        done && \
+        python3 -m pip install --no-cache-dir --break-system-packages --no-deps openai-whisper && \
+        python3 -m pip install --no-cache-dir --break-system-packages "numpy<2" numba tiktoken more-itertools && \
+        (python3 -c "import torch" 2>/dev/null && python3 -c "import whisper; whisper.load_model('base.en')" || true); \
+    fi
+# openai-whisper is for the Whisper GPU server (whisper_server.py, started by start_whisper_gpu.sh). It is installed with --no-deps
+# so pip does not replace the Jetson's CUDA PyTorch (from the PETE step) with a CPU one. The base.en weights are downloaded into the
+# image when PyTorch is there, so nothing is fetched on the first start.
+
+# Pete's language model (ros/src/core/llm.py): the anthropic package for Claude, and the small local vision model
+# (LFM2.5-VL 1.6B) that answers without a key or a connection. The model's two files are fetched with curl, not
+# "ollama pull hf.co/...": on networks that reach the internet through NAT64 (the university's), Ollama refuses the
+# download server's address. A layer of its own, after the others, so adding it does not rebuild them.
+COPY docker/lfm2.5-vl.Modelfile /tmp/lfm/Modelfile
+RUN if [ "$PETE" = "true" ]; then \
+        python3 -m pip install --no-cache-dir --break-system-packages anthropic && cd /tmp/lfm && \
+        curl -fL --retry 5 --retry-all-errors -o model.gguf https://huggingface.co/LiquidAI/LFM2.5-VL-1.6B-GGUF/resolve/main/LFM2.5-VL-1.6B-Q4_K_M.gguf && \
+        curl -fL --retry 5 --retry-all-errors -o mmproj.gguf https://huggingface.co/LiquidAI/LFM2.5-VL-1.6B-GGUF/resolve/main/mmproj-LFM2.5-VL-1.6b-Q8_0.gguf && \
+        (ollama serve > /dev/null 2>&1 &) && sleep 5 && ollama create lfm2.5-vl:1.6b -f Modelfile; \
+    fi && rm -rf /tmp/lfm
 
 RUN printf '\nsource /opt/ros/jazzy/setup.bash\nif [ -f /workspace/install/setup.bash ]; then source /workspace/install/setup.bash; fi\n' >> /etc/bash.bashrc
 
