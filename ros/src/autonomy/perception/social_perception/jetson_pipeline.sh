@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Runs the already-tested ROS 2 perception pipeline inside navigoat:people-dev.
+# Runs social perception inside the shared navigoat-dev container.
 # This script is executed INSIDE the Docker container.
 set -Eeuo pipefail
 export PATH="/opt/people_env/bin:$PATH"
-APP_DIR=/workspace/enid/social_perception/femto_id_velocity_tracker
+APP_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/femto_id_velocity_tracker" && pwd)"
 cd "$APP_DIR"
 
 if [[ ! -f femto_track_people.py || ! -f social_tracking_dashboard.py ]]; then
@@ -12,7 +12,7 @@ if [[ ! -f femto_track_people.py || ! -f social_tracking_dashboard.py ]]; then
 fi
 
 # Keep all processes' output attached to the container's stdout/stderr,
-# so `sudo docker logs -f navigoat-social` shows it without more terminals.
+# so the attached terminal shows the pipeline logs.
 pids=()
 cleanup() {
   trap - EXIT INT TERM
@@ -60,7 +60,7 @@ python3 -u social_tracking_dashboard.py \
   --port "${DASHBOARD_PORT:-8765}" &
 pids+=("$!")
 
-echo "[pipeline] Started all four components. Waiting; Docker handles lifecycle."
+echo "[pipeline] Started all four components. Keep this terminal open; Ctrl+C stops this pipeline."
 # If any component exits, terminate the whole stack to avoid leaving
 # a partially broken perception pipeline running. Restart manually.
 set +e

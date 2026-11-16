@@ -62,3 +62,22 @@ RUN printf '\nsource /opt/ros/jazzy/setup.bash\nif [ -f /workspace/install/setup
 RUN printf '\nif command -v ollama > /dev/null && ! pgrep -x ollama > /dev/null; then (ollama serve > /tmp/ollama.log 2>&1 &); fi\n' >> /etc/bash.bashrc
 
 WORKDIR /workspace
+
+# Social perception: keep Python dependencies local to its pipeline.
+ARG SOCIAL=true
+ARG PEOPLE_TORCH_INDEX_URL=https://download.pytorch.org/whl/cu132
+RUN if [ "$SOCIAL" = "true" ]; then \
+        apt-get update && apt-get install -y --no-install-recommends \
+            python3-venv python3-pip git libgl1 libglib2.0-0 \
+            ros-jazzy-orbbec-camera ros-jazzy-orbbec-description \
+            ros-jazzy-depth-image-proc ros-jazzy-cv-bridge \
+            ros-jazzy-message-filters usbutils && \
+        rm -rf /var/lib/apt/lists/* && \
+        python3 -m venv --system-site-packages /opt/people_env && \
+        /opt/people_env/bin/python -m pip install --no-cache-dir --upgrade pip && \
+        /opt/people_env/bin/python -m pip install --no-cache-dir --ignore-installed \
+            torch torchvision --index-url "$PEOPLE_TORCH_INDEX_URL" && \
+        /opt/people_env/bin/python -m pip install --no-cache-dir \
+            "numpy<2" scipy ultralytics git+https://github.com/ultralytics/CLIP.git && \
+        /opt/people_env/bin/python -c "import torch, torchvision, cv_bridge, message_filters, rclpy; print('Social PyTorch:', torch.__version__, 'CUDA:', torch.version.cuda)"; \
+    fi
