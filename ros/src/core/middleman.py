@@ -13,6 +13,11 @@ Modes (the middleman only handles going somewhere, following, and stopping):
 Going to a location, object or GPS destination ends by itself: the code that drives it calls finish() on arrival.
 Following and manual mode have no goal, so they only end when the user says stop or exits the mode.
 
+"Remember this place as X" saves where the robot is now: the node publishes X on /navigation/save_place (navigation's
+places_node stores the position). places_node then sends all saved names back on /navigation/places, and
+set_saved_places() adds them to the places "take me to X" understands, next to the ones in catalog.py, and tells the
+language model about them too (a saved place has no purpose line like the catalog's, so the model goes by its name).
+
 "Where is X" / "find X" takes the user to X, the same as "take me to X". Everything else is about what the camera
 sees ("what's in front of me", "is the light on?") and is not the middleman's job: the text goes straight to perception over ROS (see middleman_node.py) and the
 mode is unchanged. A place or object that is not in catalog.py gets a spoken reply ("I don't know where the piano is.");
@@ -66,10 +71,15 @@ class Decision:
     stop: bool = False  # True for a stop request, mode is IDLE
     reply: str = ''  # what Pete says out loud
     forward: str = ''  # the full text for perception (what the camera sees); mode is None
+    save_place: str = ''  # "remember this place as the study": the name for navigation to save the robot's position under; mode is None
 
 
 WAKE_WORDS = ('hey pete', 'ok pete', 'pete')
 
+# "remember this place as the study", "save this spot as kitchen": navigation saves where the robot is now under that name.
+# "store" is not a verb here: "take me to the store near here" is a request to go somewhere.
+_SAVE_PLACE = re.compile(r"\b(remember|save|mark)\b (this|here|(my|the) (current )?(place|location|spot|position))\b")
+_SAVE_NAME = re.compile(r"\b(as|called|named)\b(?P<name>.*)")
 _STOP = re.compile(r"^((please|ok|okay|just) )*(stop|halt|cancel|wait|freeze|pause|never ?mind|hold on|enough)\b|\b(stop|quit) (following|moving|driving)\b|\b(don't|do not) (follow|move|go)\b|\bthat's enough\b")
 _HELP = re.compile(r"^((please|somebody|someone) )?(help( me)?|i need help|emergency|call (for )?help)$|\b(i'm|i am) (lost|hurt)\b|\bi (fell|got lost)\b")
 # Leaving an open-ended mode: "exit manual mode", "stop following", "leave follow mode". Checked before _MANUAL.
@@ -165,6 +175,8 @@ def close_to(target, names):
 
 
 def as_location(target, locations):
+    if target in locations:
+        return target  # a name that is itself a place wins over an alias, so a saved "lab" is not the laboratory
     name = LOCATION_ALIASES.get(target, target)
     return name if name in locations else close_to(name, locations)
 
@@ -259,13 +271,21 @@ def qwen_interpreter(locations=LOCATIONS, saved=None, url=OLLAMA_URL, model=QWEN
     or None if it is slow, unreachable or not sure. It can only answer with a name from the lists, so it cannot start
     follow, manual or any other mode: those stay with the rules."""
     saved = saved or {}
-    places = ', '.join(f'{p} ({LOCATION_DESCRIPTIONS[p]})' if p in LOCATION_DESCRIPTIONS else p for p in locations)
-    prompt = QWEN_PROMPT.format(locations=places, objects=', '.join(OBJECTS))
-    names = list(dict.fromkeys(list(locations) + list(OBJECTS))) + ['']
-    schema = {'type': 'object', 'properties': {'match': {'type': 'string', 'enum': names}, 'confidence': {'type': 'number'}},
-              'required': ['match', 'confidence'], 'additionalProperties': False}
+    current = {}  # what the model is told about: set_places() replaces all of it at once
+
+    def set_places(places):
+        """Tell the model about these places (the catalog's, and the ones saved by voice) instead of the ones it has now."""
+        places = list(places)
+        described = ', '.join(f'{p} ({LOCATION_DESCRIPTIONS[p]})' if p in LOCATION_DESCRIPTIONS else p for p in places)
+        names = list(dict.fromkeys(places + list(OBJECTS))) + ['']
+        schema = {'type': 'object', 'properties': {'match': {'type': 'string', 'enum': names}, 'confidence': {'type': 'number'}},
+                  'required': ['match', 'confidence'], 'additionalProperties': False}
+        current['told'] = (places, QWEN_PROMPT.format(locations=described, objects=', '.join(OBJECTS)), schema)  # one assignment: never half old, half new
+
+    set_places(locations)
 
     def interpret(text, minimum=CONFIDENCE_THRESHOLD):
+        locations, prompt, schema = current['told']
         messages = [{'role': 'system', 'content': prompt}, {'role': 'user', 'content': text}]
         body = {'model': model, 'stream': False, 'keep_alive': -1, 'format': schema, 'options': {**OLLAMA_OPTIONS, 'num_predict': 40, 'temperature': 0}, 'messages': messages}
         try:
@@ -291,6 +311,7 @@ def qwen_interpreter(locations=LOCATIONS, saved=None, url=OLLAMA_URL, model=QWEN
         return resolve_known(match, text, locations, saved)
 
     interpret.warm_up = lambda: warm_up_qwen(url, model)
+    interpret.set_places = set_places
     return interpret
 
 
@@ -331,6 +352,16 @@ def classify_by_rules(text, locations=LOCATIONS, require_wake_word=False, saved=
         return Decision(Mode.HELP, text=text, reply='Calling for help.')
     if _TWO_STEPS.search(text):
         return Decision(None, text=text, reply='One at a time.')
+    if _SAVE_PLACE.search(text):
+        match = _SAVE_NAME.search(text)
+        name = clean_target(match.group('name')) if match else ''
+        if name in ('well', 'too', 'also'):  # "remember this as well" has no name
+            name = ''
+        if not name:
+            return Decision(None, text=text, reply='What should I call this place? Say: remember this place as, and the name.')
+        if _STOP.search(name) or _HELP.search(name) or _FOLLOW.search(name) or _MANUAL.search(name) or _GPS.search(name):
+            return Decision(None, text=text, reply=f"I can't call a place {name}. Pick another name.")  # it would be heard as a command
+        return Decision(None, text=text, save_place=name, reply=f'Remembering this place as {name}.')
     if _MANUAL.search(text):
         return manual_decision(text)
     if _LOOK.search(text):
@@ -394,7 +425,8 @@ class Middleman:
     finishes, so it cannot start a mode after the stop."""
 
     def __init__(self, locations=LOCATIONS, require_wake_word=False, saved=None, interpreter=None, on_ack=None):
-        self.locations = list(locations)
+        self.catalog_locations = list(locations)
+        self.locations = list(locations)  # the catalog's places, then the ones saved by voice (set_saved_places)
         self.saved = dict(saved or {})
         self.require_wake_word = require_wake_word
         self.interpreter = interpreter
@@ -403,6 +435,14 @@ class Middleman:
         self.current = None
         self._lock = threading.RLock()
         self._epoch = 0  # raised by every stop or help, to cancel the requests heard before it
+
+    def set_saved_places(self, names):
+        """The places navigation has saved ("remember this place as the balcony"). They are understood like the catalog's
+        places, and replace the earlier list, so a forgotten place goes away."""
+        with self._lock:
+            self.locations = self.catalog_locations + [name for name in names if name not in self.catalog_locations]
+            if hasattr(self.interpreter, 'set_places'):
+                self.interpreter.set_places(self.locations)  # the language model is told about them too
 
     def _interrupts(self, text):
         text = strip_wake_word(normalise(text), self.require_wake_word)

@@ -102,6 +102,9 @@ class PlacesNode(Node):
         # transient local: RViz still gets the markers if it starts after this node
         latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
         self.markers_pub = self.create_publisher(MarkerArray, '/navigation/places_markers', latched)
+        # the saved names as a JSON list, for the middleman: it understands them next to its own places. Also latched,
+        # so a middleman that starts later still gets them
+        self.names_pub = self.create_publisher(String, '/navigation/places', latched)
 
         # subscribers = the topics we listen to. when a message comes in, the function at the end gets called with it
         self.create_subscription(String, '/navigation/save_place', self.on_save, 10)
@@ -186,7 +189,8 @@ class PlacesNode(Node):
         return p.x, p.y
 
     def publish_markers(self):
-        """An orange arrow and the name for every saved place, for RViz."""
+        """An orange arrow and the name for every saved place, for RViz. Also sends the names to the middleman."""
+        self.names_pub.publish(String(data=json.dumps(sorted(self.places))))
         # start with a DELETEALL so that places we forgot also disappear from RViz
         markers = MarkerArray(markers=[Marker(action=Marker.DELETEALL)])
         for i, (name, place) in enumerate(sorted(self.places.items())):
@@ -290,13 +294,18 @@ class PlacesNode(Node):
         # remember where the robot is right now, under the name in the message
         name = normalise(msg.data)
         pose = self.robot_pose()
-        if not name or pose is None:
-            return  # empty name, or we don't know where the robot is
+        if not name:
+            return
+        if pose is None:  # we don't know where the robot is (robot_pose has already said why on the status topic)
+            self.status(f'error:could not save {name}')
+            self.say(f"I couldn't save {name}. I don't know where I am.")
+            return
         # rounded to the millimetre so the yaml file stays readable
         self.places[name] = {'x': round(pose[0], 3), 'y': round(pose[1], 3), 'yaw': round(pose[2], 3)}
         self.save_places()  # write the file straight away, so it's still there after a restart
         self.publish_markers()
         self.status(f'saved:{name}')
+        self.say(f'Saved {name}.')  # the middleman has only said "Remembering this place": this is how it went
 
     def on_forget(self, msg):
         name = normalise(msg.data)

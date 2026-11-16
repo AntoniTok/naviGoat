@@ -32,6 +32,7 @@ These are all the topics our nodes listen to and send. If you're connecting some
 | `/people` | `navigoat_msgs/People` | social_layer, feedback_node | every person on the map with their velocity, 10 times a second | people_node |
 | `/navigation/proximity_feedback` | `std_msgs/UInt8MultiArray` | handle / wristband | `[side, magnitude]` for the closest person: side 0 = left, 1 = right, magnitude 0 to 255 (stronger = closer) | feedback_node |
 | `/navigation/turn_feedback` | `std_msgs/UInt8MultiArray` | handle / wristband | `[side, magnitude]` for the next turn: stronger = sharper turn | feedback_node |
+| `/navigation/places` | `std_msgs/String` | middleman | JSON list of the saved place names, e.g. `["balcony", "lab"]`, sent at start and after every save or forget (latched). The middleman understands them like its own places | places_node |
 | `/navigation/places_markers` | `visualization_msgs/MarkerArray` | RViz | the saved places as orange arrows with their names | places_node |
 | `/navigation/people_markers` | `visualization_msgs/MarkerArray` | RViz | the people as cylinders (blue = real, purple = fake), with an arrow in front of walkers | people_node |
 
@@ -215,4 +216,4 @@ The turn signal reads Nav2's planned path. Once the custom MPC exists, its predi
 - **Enid's tracker** is on the `enid/social-perception` branch, not on main yet. It gives positions relative to the camera, which people_node already handles. If it tracks in `odom` later, it could publish `navigoat_msgs/People` itself.
 - **Failed drives**: Pete says so on `/pete/response`, but the middleman stays in location mode until the next request. `Middleman.fail()` exists, it just needs a topic.
 - **The lidar layers are off in `nav2_sim_params.yaml`**, so in Gazebo Nav2 only avoids what's on the map and the people. Before turning them on, set `min_obstacle_height` above the floor, or the 3D lidar marks the floor as an obstacle.
-- **Saving places by voice** ("Pete, remember this as the kitchen") needs a rule in the middleman that publishes the name on `/navigation/save_place`.
+- **Saving places by voice** is done: "Pete, remember this place as the balcony" makes the middleman say "Remembering this place as balcony." and publish the name on `/navigation/save_place`. places_node then says "Saved balcony.", or "I couldn't save balcony. I don't know where I am." when it has no position on the map, and sends the saved names to the middleman on `/navigation/places`.

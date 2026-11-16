@@ -79,6 +79,69 @@ class ClassifyTest(unittest.TestCase):
         with mock.patch.object(middleman.urllib.request, 'urlopen', side_effect=AssertionError('Qwen was asked')):
             self.assertEqual(classify('pete where is the cup', interpreter=qwen_interpreter()).target, 'cup')
 
+    def test_remember_this_place_saves_it_under_the_name(self):
+        for text, name in (('remember this place as the study', 'study'), ('pete remember this place as study', 'study'),
+                           ('save this spot as my room', 'room'), ('remember here as the lab', 'lab'),
+                           ('mark this place called the garden', 'garden')):
+            with self.subTest(text):
+                decision = classify(text)
+                self.assertEqual((decision.mode, decision.save_place), (None, name))
+                self.assertEqual(decision.reply, f'Remembering this place as {name}.')
+
+    def test_remember_this_place_without_a_name_asks_for_one(self):
+        decision = classify('pete remember this place')
+        self.assertEqual(decision.save_place, '')
+        self.assertIn('call this place', decision.reply)
+
+    def test_remember_this_place_is_not_set_off_by_ordinary_requests(self):
+        for text in ('take me to the store near here', 'where is the store here', 'save me from here'):
+            with self.subTest(text):
+                self.assertEqual(classify(text).save_place, '')
+                self.assertNotIn('call this place', classify(text).reply)
+
+    def test_remember_this_place_needs_a_usable_name(self):
+        self.assertIn('call this place', classify('pete remember this as well').reply)
+        self.assertEqual(classify('pete remember this place as stop').save_place, '')
+        self.assertIn("can't call a place", classify('pete remember this place as stop').reply)
+        self.assertEqual(classify('pete remember my location as the lab').save_place, 'lab')
+        self.assertEqual(classify('pete save here as the lab and then take me home').reply, 'One at a time.')
+
+    def test_the_language_model_is_told_the_saved_places(self):
+        import json, io
+        sent = []
+
+        def fake_urlopen(request, timeout=0):
+            sent.append(json.loads(request.data))
+            return io.BytesIO(json.dumps({'message': {'content': json.dumps({'match': 'balcony', 'confidence': 0.95})}}).encode())
+
+        with mock.patch.object(middleman.llm, 'ask_cloud', return_value=None), mock.patch.object(middleman.urllib.request, 'urlopen', fake_urlopen):
+            bot = Middleman(interpreter=qwen_interpreter())
+            bot.set_saved_places(['balcony'])
+            decision = bot.handle('pete i want some fresh air')
+        body = sent[-1]
+        self.assertIn('balcony', body['messages'][0]['content'])
+        self.assertIn('balcony', body['format']['properties']['match']['enum'])
+        self.assertEqual((decision.mode, decision.target), (Mode.LOCATION, 'balcony'))
+        bot.set_saved_places([])  # forgotten: the model is no longer told about it
+        with mock.patch.object(middleman.llm, 'ask_cloud', return_value=None), mock.patch.object(middleman.urllib.request, 'urlopen', fake_urlopen):
+            bot.handle('pete i want some fresh air')
+        self.assertNotIn('balcony', sent[-1]['messages'][0]['content'])
+
+    def test_a_remembered_place_can_be_asked_for(self):
+        bot = Middleman()
+        self.assertIn("don't know", bot.handle('take me to the balcony').reply)
+        bot.set_saved_places(['balcony'])  # what navigation sends back once it has saved the place
+        decision = bot.handle('take me to the balcony')
+        self.assertEqual((decision.mode, decision.target), (Mode.LOCATION, 'balcony'))
+
+    def test_a_saved_place_wins_over_an_alias_and_a_forgotten_one_goes_away(self):
+        bot = Middleman()
+        self.assertEqual(bot.handle('take me to the lab').target, 'laboratory')
+        bot.set_saved_places(['lab'])
+        self.assertEqual(bot.handle('take me to the lab').target, 'lab')
+        bot.set_saved_places([])
+        self.assertEqual(bot.handle('take me to the lab').target, 'laboratory')
+
     def test_i_need_to_find_a_place_still_takes_you_there(self):
         self.assertEqual(classify('I need to find the bathroom').mode, Mode.LOCATION)
 

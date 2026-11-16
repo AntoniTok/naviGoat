@@ -266,12 +266,13 @@ def load_model(args):
     return WhisperModel(args.model, device='auto', compute_type='default')
 
 
-def load_prompt():
-    """The hint for Whisper: our unusual place names from core/catalog.py, or the built-in one if that cannot be found."""
+def load_prompt(saved=()):
+    """The hint for Whisper: our unusual place names from core/catalog.py plus the places saved by voice (saved), or the
+    built-in one if the catalog cannot be found."""
     try:
         sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'core'))
         import catalog
-        return catalog.speech_prompt()
+        return catalog.speech_prompt(saved)
     except Exception:
         return PROMPT
 
@@ -292,6 +293,12 @@ class Voice:
         self.publish = publish
         self.speaker = Speaker(args.voice, args.voice_dir, args.output_device, args.speed)
         self.awaiting_follow_up = False  # set by a reply: the next phrase may skip the wake word
+        self.saved_places = []  # the places saved by voice, from /navigation/places: Whisper's hint includes them
+        self.prompt = load_prompt()
+
+    def set_saved_places(self, names):
+        self.saved_places = list(names)
+        self.prompt = load_prompt(self.saved_places)  # replaced as a whole, so the listening thread never sees half of it
 
     def on_reply(self, text):
         print(f'robot: {text}')
@@ -306,7 +313,6 @@ class Voice:
 
     def listen(self):
         model = load_model(self.args)
-        prompt = load_prompt()
 
         def muted():
             return self.speaker.busy() or time.monotonic() < self.speaker.until + 0.5
@@ -314,7 +320,7 @@ class Voice:
         print("Listening. Say 'Pete, ...'" if self.args.wake_word else 'Listening.')
         for audio in utterances(self.args.device, muted, self.args.min_rms, self.args.silence, self.args.max_phrase,
                                vad=self.args.vad, short_s=self.args.short_phrase, short_silence_s=self.args.short_silence):
-            text = transcribe(model, audio, prompt)
+            text = transcribe(model, audio, self.prompt)
             if not text:
                 continue
             if self.addressed(text):
@@ -360,6 +366,7 @@ def read_parameters(node, args):
 
 def run_ros(args):
     import rclpy
+    from rclpy.qos import DurabilityPolicy, QoSProfile
     from std_msgs.msg import String
 
     rclpy.init()
@@ -368,6 +375,14 @@ def run_ros(args):
     text_pub = node.create_publisher(String, args.text_topic, 10)
     voice = Voice(args, lambda text: text_pub.publish(String(data=text)))
     node.create_subscription(String, '/pete/response', lambda msg: voice.on_reply(msg.data), 10)
+
+    def on_places(msg):  # navigation's saved places (a JSON list, latched): Whisper is told these names too
+        try:
+            voice.set_saved_places(str(name) for name in json.loads(msg.data))
+        except (ValueError, TypeError):
+            pass
+
+    node.create_subscription(String, '/navigation/places', on_places, QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
     if not args.no_listen:
         threading.Thread(target=voice.listen, daemon=True).start()
     try:

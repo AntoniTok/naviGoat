@@ -100,9 +100,17 @@ SPEECH_HINT = [
     'Dangoor Plaza', 'Beit Quad', 'Rasa Kitchen', 'Triple E']
 
 
-def speech_prompt():
+MAX_SAVED_IN_PROMPT = 20  # Whisper only reads about the last 220 tokens of a hint
+
+
+def speech_prompt(saved=()):
+    """The hint for Whisper. saved is the places the user saved by voice (navigation's /navigation/places): they are
+    often unusual words, so Whisper is told them too."""
+    names = list(SPEECH_HINT)
+    known = {name.lower() for name in names}
+    names += [name.title() for name in list(saved)[-MAX_SAVED_IN_PROMPT:] if name.lower() not in known]
     return ('Pete, follow me. Pete, stop. Pete, where is the bottle, the cup, the keys, the phone, the glasses, the chair? '
-            'Pete, take me to the ' + ', '.join(SPEECH_HINT) + '.')
+            'Pete, take me to the ' + ', '.join(names) + '.')
 
 
 # What a place is for, shown to Qwen next to the name so a need ("I'm hungry", "I have to study") can be matched to a

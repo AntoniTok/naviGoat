@@ -11,6 +11,8 @@
                                                    search is spoken ("I couldn't find the chair.") and the mode goes back to idle
     description_topic    /scene_description   in   perception's description of the camera view, spoken through the response topic
     done_topic           /middleman/done      in   the robot reached the goal of a location, object or GPS request
+    save_place_topic     /navigation/save_place  out  the name from "remember this place as X"; navigation saves the robot's position under it
+    places_topic         /navigation/places   in   JSON list of the names navigation has saved (latched): understood like the catalog's places
 
 Every topic name above is a ROS parameter (the name in the first column, the default in the second), and so is use_qwen.
 
@@ -29,7 +31,8 @@ from middleman import DESCRIBE, Middleman, Mode, qwen_interpreter
 TOPICS = {
     'speech_topic': '/speech/text', 'response_topic': '/pete/response', 'middleman_mode_topic': '/middleman/mode',
     'heard_topic': '/middleman/heard', 'mode_topic': '/mode', 'goal_topic': '/goal', 'status_topic': '/object_status',
-    'description_topic': '/scene_description', 'done_topic': '/middleman/done'}
+    'description_topic': '/scene_description', 'done_topic': '/middleman/done', 'save_place_topic': '/navigation/save_place',
+    'places_topic': '/navigation/places'}
 
 CANNOT_ANSWER = "Sorry, I can only describe what is in front of me."
 
@@ -50,6 +53,7 @@ def main():
     import rclpy
     from rclpy.callback_groups import ReentrantCallbackGroup
     from rclpy.executors import MultiThreadedExecutor
+    from rclpy.qos import DurabilityPolicy, QoSProfile
     from std_msgs.msg import String
 
     rclpy.init()
@@ -61,6 +65,7 @@ def main():
     response_pub = node.create_publisher(String, topic['response_topic'], 10)
     mode_pub = node.create_publisher(String, topic['middleman_mode_topic'], 10)
     ack_pub = node.create_publisher(String, topic['heard_topic'], 10)
+    save_place_pub = node.create_publisher(String, topic['save_place_topic'], 10)
     perception = {name: node.create_publisher(String, topic[name], 10) for name in ('mode_topic', 'goal_topic')}
 
     interpreter = qwen_interpreter() if use_qwen else None
@@ -87,6 +92,8 @@ def main():
                 send(describe_messages())
             else:
                 response_pub.publish(String(data=CANNOT_ANSWER))
+        if decision.save_place:  # "remember this place as the study": navigation saves the robot's position under that name
+            save_place_pub.publish(String(data=decision.save_place))
         if decision.stop:
             announce('idle', stop=True)
         elif decision.mode is not None:
@@ -114,6 +121,15 @@ def main():
             announce('idle')
         response_pub.publish(String(data=decision.reply))
 
+    def on_places(msg):
+        """navigation's saved places, a JSON list of names: understood next to the catalog's places."""
+        try:
+            names = [str(name) for name in json.loads(msg.data)]
+        except (ValueError, TypeError):
+            return
+        middleman.set_saved_places(names)
+        node.get_logger().info(f'Saved places: {", ".join(names) or "none"}.')
+
     def on_description(msg):
         response_pub.publish(String(data=msg.data))  # speak it
 
@@ -123,6 +139,9 @@ def main():
     node.create_subscription(String, topic['done_topic'], on_done, 10, callback_group=group)
     node.create_subscription(String, topic['status_topic'], on_object_status, 10, callback_group=group)
     node.create_subscription(String, topic['description_topic'], on_description, 10, callback_group=group)
+    # navigation's saved places are latched, so the ones from earlier runs arrive as soon as this node starts
+    node.create_subscription(String, topic['places_topic'], on_places, QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL),
+                             callback_group=group)
     import llm
     if not interpreter:
         model = 'off (rules only)'
