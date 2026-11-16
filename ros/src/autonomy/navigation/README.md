@@ -146,6 +146,13 @@ Things to try:
   ros2 topic pub --once /speech/text std_msgs/msg/String "{data: 'pete take me to the kitchen'}"
   ```
 
+- **Real people on the simulated map.** Start Enid's tracker on the Jetson as usual (it runs the real camera too), then the simulation with `real_people:=true`. Whoever stands in front of the real camera shows up in front of the simulated robot, and the robot avoids them with the social layer only (the simulated lidar can't see them).
+  ```bash
+  ros2 launch .../navigation_sim.launch.py real_people:=true
+  export ROS_DOMAIN_ID=42   # in every other terminal you use with this simulation
+  ```
+  Both cameras publish `/camera/color/image_raw` and friends, so the simulation goes on its own ROS domain (`sim_domain`, 42) to keep them apart, and people_node listens to the tracker on its domain (`tracker_domain`, 0) and passes `/social_perception/tracks` on. Point the real camera straight ahead, like the simulated one: the people are placed as if it were mounted on the robot.
+
 If the robot draws a path but doesn't move, check `ros2 topic echo /model/pioneer3at/cmd_vel`. If it only shows zeros, the collision monitor is stopping it (it thinks something is inside the robot).
 
 ## The social rules

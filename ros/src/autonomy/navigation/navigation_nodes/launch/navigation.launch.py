@@ -11,8 +11,8 @@ from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, ExecuteProcess
 from launch.substitutions import LaunchConfiguration
 
-# the navigation_nodes folder (this file is in navigation_nodes/launch/, so it's two dirnames up)
-NODES_DIR = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+# the navigation_nodes folder (this file is in navigation_nodes/launch/thisfile.py, so it's two dirnames up)
+NODES_DIR = os.path.dirname(os.path.dirname(os.path.realpath(__file__))) # realpath works even with the symlink thing 
 
 
 def node(script, *params):
@@ -20,7 +20,7 @@ def node(script, *params):
     # this builds the same command as typing:  python3 places_node.py --ros-args -p places_file:=... -p ...
     cmd = ['python3', os.path.join(NODES_DIR, script), '--ros-args']
     for name in params:
-        cmd += ['-p', [f'{name}:=', LaunchConfiguration(name)]]  # LaunchConfiguration(name) = that argument's value
+        cmd += ['-p', [f'{name}:=', LaunchConfiguration(name)]]
     return ExecuteProcess(cmd=cmd, output='screen')  # output='screen' shows the node's prints in this terminal
 
 
@@ -34,7 +34,8 @@ def generate_launch_description():
         DeclareLaunchArgument('base_frame', default_value='base_link'),
         DeclareLaunchArgument('camera_frame', default_value='camera_link'),
         DeclareLaunchArgument('fake_people', default_value='none', description='YAML file of made-up people, for testing'),
+        DeclareLaunchArgument('tracker_domain', default_value='-1', description='ROS domain of the people tracker, -1 = ours'),
         node('places_node.py', 'places_file', 'use_sim_time', 'map_frame', 'base_frame'),
-        node('people_node.py', 'use_sim_time', 'map_frame', 'camera_frame', 'fake_people'),
+        node('people_node.py', 'use_sim_time', 'map_frame', 'camera_frame', 'fake_people', 'tracker_domain'),
         node('feedback_node.py', 'use_sim_time', 'map_frame', 'base_frame'),
     ])
