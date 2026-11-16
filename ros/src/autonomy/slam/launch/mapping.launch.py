@@ -23,7 +23,7 @@ def generate_launch_description():
         DeclareLaunchArgument('lidar_port', default_value='/dev/unilidar'),
         DeclareLaunchArgument('lidar_x', default_value='0'),
         DeclareLaunchArgument('lidar_y', default_value='0'),
-        DeclareLaunchArgument('lidar_z', default_value='0.3'),
+        DeclareLaunchArgument('lidar_z', default_value='0.225'),
         DeclareLaunchArgument('lidar_roll', default_value='0'),
         DeclareLaunchArgument('lidar_pitch', default_value='0'),
         DeclareLaunchArgument('lidar_yaw', default_value='0'),

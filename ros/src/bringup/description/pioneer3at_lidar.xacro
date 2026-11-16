@@ -4,7 +4,7 @@
 
   <xacro:arg name="lidar_x" default="0"/>
   <xacro:arg name="lidar_y" default="0"/>
-  <xacro:arg name="lidar_z" default="0.3"/>
+  <xacro:arg name="lidar_z" default="0.225"/>
   <xacro:arg name="lidar_roll" default="0"/>
   <xacro:arg name="lidar_pitch" default="0"/>
   <xacro:arg name="lidar_yaw" default="0"/>
@@ -23,9 +23,9 @@
       </material>
     </visual>
     <visual>
-      <origin xyz="0 0 -0.15"/>
+      <origin xyz="0 0 -0.1275"/>
       <geometry>
-        <cylinder radius="0.01" length="0.3"/>
+        <cylinder radius="0.01" length="0.195"/>
       </geometry>
       <material name="mount_grey">
         <color rgba="0.4 0.4 0.4 1"/>
@@ -39,7 +39,6 @@
     <child link="unilidar_lidar"/>
   </joint>
 
-  <!-- approximate camera pose pending measurement -->
   <!-- no visual to avoid collision monitor obstacle -->
   <link name="camera_link">
     <inertial>
@@ -49,7 +48,7 @@
   </link>
 
   <joint name="top_plate_camera_joint" type="fixed">
-    <origin xyz="0.20 0 0.10" rpy="0 0 0"/>
+    <origin xyz="0.20 0 0.160" rpy="0 0 0"/>
     <parent link="top_plate"/>
     <child link="camera_link"/>
   </joint>
