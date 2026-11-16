@@ -20,6 +20,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/PlanRoute.srv"
   "srv/SetRoute.srv"
   "srv/ResolveDestination.srv"
+  "srv/Geocode.srv"
   "action/NavigateTo.action"
   DEPENDENCIES std_msgs geometry_msgs nav_msgs
 )

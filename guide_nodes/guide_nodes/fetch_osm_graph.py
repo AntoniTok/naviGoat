@@ -9,16 +9,18 @@ Map data (c) OpenStreetMap contributors, available under the ODbL.
 """
 
 import argparse
+from collections import Counter
 import datetime
 import os
-from collections import Counter
 import time
 
-import osmnx as ox
-import yaml
+# The graph's area, as the geocoder reads it back (same calculation).
+from guide_core.geocoding import BBox
 # Road types (major/minor) shared with the planner's cost model, so crossing
 # labels and costs always agree.
-   from guide_core.walk_costs import MAJOR_ROADS, MINOR_ROADS, is_minor_service, is_road
+from guide_core.walk_costs import is_minor_service, is_road, MAJOR_ROADS, MINOR_ROADS
+import osmnx as ox
+import yaml
 
 # Same origin as the localizer: the centre of the local east-north (map) frame.
 DEFAULT_ORIGIN_LAT = 51.4988
@@ -53,6 +55,7 @@ def parse_args(argv=None):
                         help='other Overpass API server, e.g. https://overpass.private.coffee/api '
                              '(default: osmnx default, overpass-api.de)')
     return parser.parse_args(argv)
+
 
 def summarise(graph):
     """Return printable lines describing the graph's size, crossings, islands and walkway types."""
@@ -96,14 +99,15 @@ def summarise(graph):
         f'Crossing nodes (highway=crossing), by crossing=: {dict(crossing_nodes.most_common())}',
         f'  ... with crossing:signals=: {dict(node_signals.most_common())}',
         f'  ... with crossing_ref=: {dict(node_refs.most_common())}',
-        f'Crossing way pieces (footway=crossing), by crossing=: {dict(crossing_ways.most_common())}',
+        'Crossing way pieces (footway=crossing), by crossing=: '
+        f'{dict(crossing_ways.most_common())}',
         f'Pedestrian island pieces (footway=traffic_island): {island_pieces}',
         f'Island-tagged nodes: crossing:island= {dict(node_island.most_common())}, '
         f'traffic_calming= {dict(node_calming.most_common())}',
         f'Walkway pieces by highway= (top 12): {dict(walkway_types.most_common(12))}',
     ]
-    
-    
+
+
 def annotate_crossed_roads(walk, roads):
     """Label each crossing node with the class of road it crosses.
 
@@ -132,6 +136,7 @@ def annotate_crossed_roads(walk, roads):
             data['crossed_road'] = 'none'  # no public road here (e.g. a cycle track)
         counts[data['crossed_road']] += 1
     return counts
+
 
 def annotate_junctions(walk, roads):
     """Label walk-graph nodes where roads meet with the road directions of each class.
@@ -167,6 +172,7 @@ def annotate_junctions(walk, roads):
             count += 1
     return count
 
+
 def download_with_retries(what, attempts=4, first_wait=30.0, **kwargs):
     """Call ox.graph_from_point(**kwargs), retrying with doubling waits on failure.
 
@@ -185,6 +191,17 @@ def download_with_retries(what, attempts=4, first_wait=30.0, **kwargs):
             time.sleep(wait)
             wait *= 2
 
+
+def graph_bbox(lat, lon, dist):
+    """Return the area downloaded, a square of +-dist metres around (lat, lon), as a dict.
+
+    Saved in the .meta.yaml so the geocoder limits online searches to it.
+    """
+    box = BBox.around(lat, lon, dist)
+    return {'min_lat': round(box.min_lat, 7), 'min_lon': round(box.min_lon, 7),
+            'max_lat': round(box.max_lat, 7), 'max_lon': round(box.max_lon, 7)}
+
+
 def main(argv=None):
     """Download, save, write metadata and print a summary."""
     args = parse_args(argv)
@@ -198,7 +215,7 @@ def main(argv=None):
     ox.settings.useful_tags_way = list(dict.fromkeys(
         list(ox.settings.useful_tags_way) + EXTRA_WAY_TAGS))
     ox.settings.cache_folder = os.path.expanduser('~/.cache/osmnx')
-    
+
     if args.overpass_url:
         ox.settings.overpass_url = args.overpass_url
 
@@ -232,9 +249,11 @@ def main(argv=None):
         'origin_lat': args.lat,
         'origin_lon': args.lon,
         'dist_m': args.dist,
+        'bbox': graph_bbox(args.lat, args.lon, args.dist),
         'network_type': 'walk',
         'simplify': False,
-        'downloaded_utc': datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds'),
+        'downloaded_utc': datetime.datetime.now(datetime.timezone.utc).isoformat(
+            timespec='seconds'),
         'osmnx_version': ox.__version__,
         'nodes': graph.number_of_nodes(),
         'directed_edges': graph.number_of_edges(),
@@ -250,10 +269,10 @@ def main(argv=None):
     print(f'Saved {meta_path}')
     for line in summarise(graph):
         print(line)
-        
+
     print(f'Crossing nodes by road crossed: {dict(crossed_counts.most_common())}')
     print(f'Road junctions labelled (junction_*_dirs): {junction_count}')
-        
+
 
 if __name__ == '__main__':
     main()

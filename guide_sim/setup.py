@@ -25,6 +25,7 @@ setup(
     entry_points={
         'console_scripts': [
             'sim_robot = guide_sim.sim_robot_node:main',
+            'fake_nominatim = guide_sim.fake_nominatim:main',
         ],
     },
 )

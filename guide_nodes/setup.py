@@ -33,6 +33,7 @@ setup(
             'fetch_osm_graph = guide_nodes.fetch_osm_graph:main',
             'plan_route = guide_nodes.plan_route_cli:main',
             'mission_manager = guide_nodes.mission_manager_node:main',
+            'geocoder = guide_nodes.geocoder_node:main',
         ],
     },
 )

@@ -11,6 +11,10 @@ All decisions are made by guide_core.mission.Mission; this node only:
 - serves the user's two inputs (guide/user_go, guide/user_pause) and
   guide/resolve_destination (look a name up without starting a trip).
 
+Names not in the curated list are looked up with the geocoder node
+(guide/geocode: Nominatim online + its on-disk cache), both for trips
+(Mission's LookUpOnline command) and for guide/resolve_destination.
+
 Nothing here ever blocks: every service call is asynchronous and its answer
 arrives later as one more event (a blocking call inside a callback would
 deadlock this single-threaded node).
@@ -32,19 +36,22 @@ from std_msgs.msg import Bool
 from std_srvs.srv import Trigger
 
 from guide_core.destinations import (
-    DestinationError, MatchConfig, MatchType, Outcome, destinations_from_dict, resolve,
+    Destination, DestinationError, MatchConfig, MatchType, Outcome, destinations_from_dict,
+    resolve,
 )
 from guide_core.geo import enu_to_latlon
+from guide_core.geocoder import Status as GeocodeStatus
 from guide_core.mission import (
-    CallPlanner, ClearRoute, ConfirmCrossing, CrossingInfo, Finish, Mission, MissionConfig,
-    MissionError, MissionGoal, NavStatus, Pause, PlanSummary, Progress, Resume, SendRoute,
-    StopRobot,
+    CallPlanner, ClearRoute, ConfirmCrossing, CrossingInfo, Finish, LookUpOnline, Mission,
+    MissionConfig, MissionError, MissionGoal, NavStatus, Pause, PlanSummary, Progress, Resume,
+    SendRoute, StopRobot,
 )
+from guide_core.online_resolve import resolve_online
 from guide_interfaces.action import NavigateTo
 from guide_interfaces.msg import (
     DestinationCandidate, MissionState, NavGoalStatus, RouteCrossing, RouteProgress,
 )
-from guide_interfaces.srv import PlanRoute, ResolveDestination, SetRoute
+from guide_interfaces.srv import Geocode, PlanRoute, ResolveDestination, SetRoute
 
 # Latched QoS, as in the other nodes: RELIABLE + TRANSIENT_LOCAL, depth 1.
 # Needed to receive guide/paused and guide/goal_status, which are latched.
@@ -108,17 +115,27 @@ class MissionManagerNode(Node):
         self.declare_parameter('failure_reset_distance', defaults.failure_reset_distance)
         self.declare_parameter('min_go_interval', defaults.min_go_interval)
         self.declare_parameter('snap_report_distance', defaults.snap_report_distance)
+        # Names not in the curated list: ask the geocoder node (true), or
+        # answer "I don't know that place" at once (false). Whether the
+        # geocoder may go online is ITS parameter (online_enabled).
+        self.declare_parameter('use_geocoder', True)
+        self.declare_parameter('geocoder_timeout', 8.0)  # s; then "couldn't search"
 
         self._origin = (self.get_parameter('origin_lat').value,
                         self.get_parameter('origin_lon').value)
         self._max_pose_age = float(self.get_parameter('max_pose_age').value)
         self._feedback_period = float(self.get_parameter('feedback_period').value)
+        self._use_geocoder = bool(self.get_parameter('use_geocoder').value)
+        self._geocoder_timeout = float(self.get_parameter('geocoder_timeout').value)
+        if not self._geocoder_timeout > 0.0:
+            raise StartupError(f'geocoder_timeout must be > 0, got {self._geocoder_timeout}')
         try:
             config = MissionConfig(
                 max_nav_failures=self.get_parameter('max_nav_failures').value,
                 failure_reset_distance=self.get_parameter('failure_reset_distance').value,
                 min_go_interval=self.get_parameter('min_go_interval').value,
-                snap_report_distance=self.get_parameter('snap_report_distance').value)
+                snap_report_distance=self.get_parameter('snap_report_distance').value,
+                online_lookup=self._use_geocoder)
         except ValueError as e:
             raise StartupError(f'Invalid mission parameter: {e}') from e
         destinations = self._load_destinations(self.get_parameter('destinations_file').value)
@@ -142,6 +159,14 @@ class MissionManagerNode(Node):
         # Mission.version last published on guide/mission_state (-1 = never).
         self._published_version = -1
 
+        # One reentrant callback group for everything that awaits (the action's
+        # execute, guide/resolve_destination) and for the geocoder client they
+        # wait on. In rclpy a callback holds its group until it finishes, even
+        # while it awaits; in the default (mutually exclusive) group the answer
+        # it waits for could then never run: a deadlock. Single-threaded
+        # executor: callbacks still run one at a time, never in parallel.
+        self._reentrant = ReentrantCallbackGroup()
+
         # --- Service clients (all called asynchronously, see _execute) ---
         # create_client(type, name): the name must match the server's exactly.
         self._plan_client = self.create_client(PlanRoute, 'guide/plan_route')
@@ -151,6 +176,8 @@ class MissionManagerNode(Node):
         self._pause_client = self.create_client(Trigger, 'guide/pause')
         self._resume_client = self.create_client(Trigger, 'guide/resume')
         self._stop_client = self.create_client(Trigger, 'guide/cancel')
+        self._geocode_client = self.create_client(Geocode, 'guide/geocode',
+                                                  callback_group=self._reentrant)
 
         # --- Subscriptions (events for Mission) ---
         # guide/pose and guide/route_progress are ordinary reliable streams;
@@ -173,10 +200,9 @@ class MissionManagerNode(Node):
             execute_callback=self._execute,
             goal_callback=self._on_goal_request,
             cancel_callback=self._on_cancel_request,
-            # Reentrant group: the (awaiting) execute callback must never stop
-            # the other callbacks from running. With our single-threaded
-            # executor they still run one at a time, never in parallel.
-            callback_group=ReentrantCallbackGroup())
+            # Reentrant group (see self._reentrant): the awaiting execute
+            # callback must never stop the other callbacks from running.
+            callback_group=self._reentrant)
 
         # --- Mission state topic (latched) ---
         # Republished after every event that changes what the user should
@@ -191,8 +217,9 @@ class MissionManagerNode(Node):
         #   ros2 service call /guide/user_go std_srvs/srv/Trigger
         self.create_service(Trigger, 'guide/user_go', self._on_user_go)
         self.create_service(Trigger, 'guide/user_pause', self._on_user_pause)
+        # resolve_destination may await the geocoder, hence the reentrant group.
         self.create_service(ResolveDestination, 'guide/resolve_destination',
-                            self._on_resolve_destination)
+                            self._on_resolve_destination, callback_group=self._reentrant)
 
         # Timer: routine feedback every feedback_period while a goal runs
         # (distance updates); changes are published at once by _run.
@@ -201,7 +228,8 @@ class MissionManagerNode(Node):
 
         self.get_logger().info(
             f'Mission manager ready: {len(destinations)} destination(s), action '
-            f"'guide/navigate_to', origin {self._origin}")
+            f"'guide/navigate_to', origin {self._origin}, other names "
+            + ('looked up with guide/geocode' if self._use_geocoder else 'not looked up'))
 
     # ---- Startup helpers ------------------------------------------------------------
 
@@ -346,6 +374,8 @@ class MissionManagerNode(Node):
         for command in commands:
             if isinstance(command, CallPlanner):
                 self._call_planner(command)
+            elif isinstance(command, LookUpOnline):
+                self._look_up(command)
             elif isinstance(command, SendRoute):
                 self._send_route(command)
             elif isinstance(command, Finish):
@@ -405,6 +435,65 @@ class MissionManagerNode(Node):
             warnings=tuple(response.warnings))
         self._run(self._mission.on_plan_result(command.plan_id, True, response.message,
                                                summary))
+
+    def _call_geocoder(self, query, on_done):
+        """Call guide/geocode for query; on_done(response, '') or on_done(None, why).
+
+        on_done is called exactly once: with the answer, or with None if the
+        geocoder is not running, the call failed, or no answer came within
+        geocoder_timeout (a one-shot timer), so nothing can wait forever.
+        """
+        if not self._geocode_client.service_is_ready():
+            on_done(None, 'the geocoder is not running')
+            return
+        done = False
+        timer = None
+
+        def finish(response, why):
+            nonlocal done
+            if done:
+                return              # the answer came after the timeout (or vice versa)
+            done = True
+            timer.cancel()
+            self.destroy_timer(timer)
+            on_done(response, why)
+
+        def on_answer(future):
+            try:
+                finish(future.result(), '')
+            except Exception as e:  # service vanished mid-call
+                finish(None, f'geocoder call failed: {e}')
+
+        timer = self.create_timer(
+            self._geocoder_timeout,
+            lambda: finish(None, f'no answer from the geocoder in {self._geocoder_timeout:.0f} s'))
+        self._geocode_client.call_async(Geocode.Request(query=query)).add_done_callback(on_answer)
+
+    @staticmethod
+    def _destinations_from(response):
+        """Geocode response candidates -> Destinations (source 'nominatim')."""
+        return tuple(Destination(name=c.name, lat=c.latitude, lon=c.longitude, note=c.note,
+                                 source=c.source or 'nominatim')
+                     for c in response.candidates)
+
+    def _look_up(self, command):
+        """LookUpOnline -> guide/geocode; answer -> Mission.on_lookup_result."""
+        self.get_logger().info(f"Looking up #{command.lookup_id} '{command.query}'")
+
+        def done(response, why):
+            if response is None:
+                self.get_logger().warning(f'Lookup #{command.lookup_id} failed: {why}')
+                self._run(self._mission.on_lookup_result(command.lookup_id,
+                                                         GeocodeStatus.OFFLINE))
+                return
+            self.get_logger().info(
+                f'Lookup #{command.lookup_id}: {GeocodeStatus(response.status).name}, '
+                f'{len(response.candidates)} candidate(s): {response.message}')
+            self._run(self._mission.on_lookup_result(
+                command.lookup_id, response.status, self._destinations_from(response),
+                response.from_cache))
+
+        self._call_geocoder(command.query, done)
 
     def _send_route(self, command):
         """SendRoute -> guide/set_route with the last plan; answer -> on_route_set."""
@@ -471,11 +560,32 @@ class MissionManagerNode(Node):
         response.success, response.message = reply.accepted, reply.text
         return response
 
-    def _on_resolve_destination(self, request, response):
-        """guide/resolve_destination: look a name up, ranked, without starting a trip."""
+    async def _on_resolve_destination(self, request, response):
+        """guide/resolve_destination: look a name up, ranked, without starting a trip.
+
+        The same chain as a trip: the curated list, then (if nothing matched)
+        the geocoder. "async def" + await: while waiting for the geocoder the
+        executor keeps running this node's other callbacks.
+        """
         config = MatchConfig(max_candidates=request.max_candidates or 5)
-        resolution = resolve(request.query, self._destinations,
-                             robot_latlon=self._robot_latlon(), config=config)
+        robot = self._robot_latlon()
+        resolution = resolve(request.query, self._destinations, robot_latlon=robot,
+                             config=config)
+        if (resolution.outcome is Outcome.NOT_FOUND and self._use_geocoder
+                and resolution.query):
+            answer = Future()   # completed by _call_geocoder's on_done
+            self._call_geocoder(resolution.query,
+                                lambda r, why: answer.set_result((r, why)))
+            geocoded, why = await answer
+            if geocoded is None:
+                self.get_logger().warning(f"Resolve '{request.query}': {why}")
+                status, found, cached = GeocodeStatus.OFFLINE, (), False
+            else:
+                status = geocoded.status
+                found = self._destinations_from(geocoded)
+                cached = geocoded.from_cache
+            resolution = resolve_online(resolution.query, status, found, robot_latlon=robot,
+                                        from_cache=cached, config=config)
         response.outcome = OUTCOME_TO_MSG[resolution.outcome]
         response.message = resolution.message
         for c in resolution.candidates:
@@ -489,7 +599,7 @@ class MissionManagerNode(Node):
             msg.longitude = float(c.destination.lon)
             msg.straight_line_distance = (-1.0 if c.distance is None
                                           else float(c.distance))
-            msg.source = 'curated'
+            msg.source = c.destination.source
             response.candidates.append(msg)
         self.get_logger().info(f"Resolve '{request.query}': {resolution.outcome.name}: "
                                f'{resolution.message}')

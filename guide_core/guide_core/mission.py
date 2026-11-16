@@ -18,6 +18,11 @@ never decided here, so the nodes cannot disagree.
                                           ^  \\--------> PAUSED (pause / Nav2 failure)
                                           +--------------/ (go)
     NAVIGATING -> ARRIVED;  any failure -> FAILED;  cancel -> IDLE
+
+Destinations by name: the curated list first. Only if it has no match, the
+geocoder is asked (LookUpOnline -> on_lookup_result); the state stays
+PLANNING meanwhile ("Searching OpenStreetMap for ..."). An online result is
+always read back in READY and waits for go, even with skip_confirmation.
 """
 
 import math
@@ -27,6 +32,9 @@ from typing import Optional, Tuple
 
 from guide_core.destinations import (
     Destination, MatchConfig, Outcome, format_distance, resolve,
+)
+from guide_core.online_resolve import (
+    FOUND_IN_CACHE, FOUND_ONLINE, LARGE_AREA_NOTE, resolve_online,
 )
 
 
@@ -127,12 +135,17 @@ class MissionConfig:
         go is ignored, so a double press cannot resume AND start a crossing.
     snap_report_distance: if the route ends further than this (m) from the
         requested point, the read-back says so.
+    online_lookup: ask the geocoder (LookUpOnline) when the curated list has
+        no match; False = fail with UNKNOWN_DESTINATION straight away. Off
+        here; the mission manager node turns it on (its parameter
+        online_lookup, default true).
     """
 
     max_nav_failures: int = 3
     failure_reset_distance: float = 5.0
     min_go_interval: float = 1.0
     snap_report_distance: float = 5.0
+    online_lookup: bool = False
 
     def __post_init__(self):
         if self.max_nav_failures < 1:
@@ -153,6 +166,14 @@ class CallPlanner:
     start_lon: float
     goal_lat: float
     goal_lon: float
+
+
+@dataclass(frozen=True)
+class LookUpOnline:
+    """Call guide/geocode for query; answer with on_lookup_result(lookup_id, ...)."""
+
+    lookup_id: int
+    query: str
 
 
 @dataclass(frozen=True)
@@ -234,14 +255,20 @@ def describe_crossing(info):
     return text + (', with an island' if info.has_island else '')
 
 
-def build_summary(name, note, plan, snap_report_distance, skip_confirmation=False):
+def build_summary(name, note, plan, snap_report_distance, skip_confirmation=False,
+                  found_in='', large_area=False):
     """The read-back sentence for READY (pure text; tested on its own).
 
     "South Kensington Station, end of the subway. About 650 m walk, 6 road
     crossings, 2 with an island. Warning: route uses 193 m of tunnel (no GPS
     there). Press go to start."
+    found_in: for online results, where they came from ('OpenStreetMap'):
+    "Found in OpenStreetMap: Royal Albert Hall. ..."
+    large_area: the destination is a large building or area whose centre
+    was searched for: the read-back says the route goes to its nearest path.
     """
-    parts = [name + (f', {note}' if note else '') + '.']
+    parts = [(f'Found in {found_in}: ' if found_in else '') + name
+             + (f', {note}' if note else '') + '.']
     n = len(plan.crossings)
     islands = sum(1 for c in plan.crossings if c.has_island)
     walk = f'{format_distance(plan.length)} walk'
@@ -250,6 +277,9 @@ def build_summary(name, note, plan, snap_report_distance, skip_confirmation=Fals
     if islands:
         crossings += f', {islands} with an island'
     parts.append(f'{walk}, {crossings}.')
+    if large_area:
+        parts.append(f'{name} is a large area: the route goes to its nearest path, '
+                     'not to an entrance.')
     for warning in plan.warnings:
         parts.append(f'Warning: {warning}.')
     if plan.goal_snap_distance > snap_report_distance:
@@ -262,6 +292,7 @@ class _Phase(Enum):
     """Where the mission is; while ACTIVE the reported state is derived."""
 
     IDLE = 'idle'
+    LOOKING_UP = 'looking_up'  # waiting for the geocoder (reported as PLANNING)
     PLANNING = 'planning'
     READY = 'ready'           # planned; waiting for go (or for the follower to accept)
     ACTIVE = 'active'         # the follower has the route
@@ -281,6 +312,7 @@ class Mission:
         self._config = config or MissionConfig()
         self._match_config = match_config or MatchConfig()
         self._plan_id = 0
+        self._lookup_id = 0
         self._route_id = 0
         self._phase = _Phase.IDLE
         self._paused = False          # copied from guide/paused (any time)
@@ -314,6 +346,7 @@ class Mission:
             return MissionState.NAVIGATING
         return {
             _Phase.IDLE: MissionState.IDLE,
+            _Phase.LOOKING_UP: MissionState.PLANNING,
             _Phase.PLANNING: MissionState.PLANNING,
             _Phase.READY: MissionState.READY,
             _Phase.ARRIVED: MissionState.ARRIVED,
@@ -338,11 +371,11 @@ class Mission:
 
     def start(self, goal, robot_latlon):
         """A NavigateTo goal was accepted. robot_latlon: (lat, lon), or None if no
-        recent position. Returns commands (CallPlanner, or Finish on failure)."""
+        recent position. Returns commands (CallPlanner, LookUpOnline when the
+        curated list has no match, or Finish on failure)."""
         if not self.can_accept():
             raise RuntimeError('start() while a mission is running; check can_accept()')
         self._reset_mission()
-        self._skip_confirmation = goal.skip_confirmation
 
         if goal.by_name:
             if not goal.destination.strip():
@@ -361,19 +394,43 @@ class Mission:
             resolution = resolve(goal.destination, self._destinations,
                                  robot_latlon=robot_latlon, config=self._match_config)
             if resolution.outcome is Outcome.NOT_FOUND:
-                return self._fail(MissionError.UNKNOWN_DESTINATION, resolution.message)
+                if not self._config.online_lookup or not resolution.query:
+                    return self._fail(MissionError.UNKNOWN_DESTINATION, resolution.message)
+                # Not in the curated list: ask the geocoder, plan when it answers.
+                self._lookup_id += 1
+                self._query = resolution.query
+                self._robot = robot_latlon
+                self._skip_requested = goal.skip_confirmation
+                self._phase = _Phase.LOOKING_UP
+                self._set_message(f"Searching OpenStreetMap for '{resolution.query}'.")
+                return (LookUpOnline(self._lookup_id, resolution.query),)
             if resolution.outcome is Outcome.AMBIGUOUS:
                 return self._fail(MissionError.AMBIGUOUS_DESTINATION, resolution.message)
             target = resolution.candidates[0].destination
         else:
             target = Destination('the requested point', goal.latitude, goal.longitude)
+        return self._plan_to(target, robot_latlon, goal.skip_confirmation)
 
-        self._dest_name, self._dest_note = target.name, target.note
-        self._plan_id += 1
-        self._phase = _Phase.PLANNING
-        self._set_message(f'Planning a route to {target.name}.')
-        return (CallPlanner(self._plan_id, robot_latlon[0], robot_latlon[1],
-                            target.lat, target.lon),)
+    def on_lookup_result(self, lookup_id, status, destinations=(), from_cache=False):
+        """The geocoder answered (or failed: pass status OFFLINE).
+
+        status: the Geocode response status; destinations: its candidates as
+        Destinations (source 'nominatim'), in its order. One result -> plan
+        to it (read back, always waits for go); several -> AMBIGUOUS; none or
+        a failure -> UNKNOWN_DESTINATION with the reason.
+        """
+        if self._phase is not _Phase.LOOKING_UP or lookup_id != self._lookup_id:
+            return ()  # answer to a cancelled or older lookup
+        resolution = resolve_online(self._query, status, destinations,
+                                    robot_latlon=self._robot, from_cache=from_cache,
+                                    config=self._match_config)
+        if resolution.outcome is Outcome.NOT_FOUND:
+            return self._fail(MissionError.UNKNOWN_DESTINATION, resolution.message)
+        if resolution.outcome is Outcome.AMBIGUOUS:
+            return self._fail(MissionError.AMBIGUOUS_DESTINATION, resolution.message)
+        target = resolution.candidates[0].destination
+        return self._plan_to(target, self._robot, self._skip_requested,
+                             FOUND_IN_CACHE if from_cache else FOUND_ONLINE)
 
     def on_plan_result(self, plan_id, success, message, plan=None):
         """The planner answered (plan is a PlanSummary when success is True)."""
@@ -385,7 +442,8 @@ class Mission:
         self._plan = plan
         self._summary = build_summary(self._dest_name, self._dest_note, plan,
                                       self._config.snap_report_distance,
-                                      self._skip_confirmation)
+                                      self._skip_confirmation, self._found_in,
+                                      self._large_area)
         self._phase = _Phase.READY
         self._set_message(self._summary)
         if self._skip_confirmation:
@@ -550,6 +608,11 @@ class Mission:
     def _reset_mission(self):
         self._dest_name = ''
         self._dest_note = ''
+        self._found_in = ''           # '' = curated / lat-lon; else where the result came from
+        self._large_area = False
+        self._query = ''              # name being looked up online
+        self._robot = None            # robot (lat, lon) when the lookup started
+        self._skip_requested = False
         self._plan = None
         self._summary = ''
         self._skip_confirmation = False
@@ -568,6 +631,20 @@ class Mission:
         self._last_go = -math.inf
         self._last_status_stamp = -math.inf
         self._last_state = None
+
+    def _plan_to(self, target, robot_latlon, skip_confirmation, found_in=''):
+        """Start planning to target. Online results never skip the read-back."""
+        online = target.source != 'curated'
+        self._dest_name = target.name
+        self._dest_note = '' if online else target.note
+        self._found_in = found_in
+        self._large_area = online and target.note == LARGE_AREA_NOTE
+        self._skip_confirmation = skip_confirmation and not online
+        self._plan_id += 1
+        self._phase = _Phase.PLANNING
+        self._set_message(f'Planning a route to {target.name}.')
+        return (CallPlanner(self._plan_id, robot_latlon[0], robot_latlon[1],
+                            target.lat, target.lon),)
 
     def _send_route(self):
         self._route_id += 1

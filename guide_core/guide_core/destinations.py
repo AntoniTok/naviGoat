@@ -40,8 +40,11 @@ class DestinationError(ValueError):
 class Destination:
     """One place the robot can take the user to.
 
-    lat/lon are WGS84 degrees of the point to walk to: the (preferably
-    step-free) entrance, not the building's centre.
+    lat/lon are WGS84 degrees of the point to walk to: for curated entries
+    the (preferably step-free) entrance, not the building's centre.
+    source: where the entry comes from: 'curated' (the team's list, checked
+    by hand) or 'nominatim' (an online search result: the centre of a
+    building or area, less trusted, always read back before moving).
     """
 
     name: str
@@ -49,6 +52,7 @@ class Destination:
     lon: float
     aliases: Tuple[str, ...] = ()
     note: str = ''
+    source: str = 'curated'
 
 
 class MatchType(Enum):

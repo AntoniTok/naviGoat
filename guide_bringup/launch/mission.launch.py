@@ -1,13 +1,15 @@
 """Full mission in simulation: one action goal takes the robot to a destination.
 
 Starts: sim robot, localizer, route follower (no route; routes come from the
-mission manager), goal sender, route planner (cached OSM graph) and mission
+mission manager), goal sender, route planner (cached OSM graph), geocoder
+(names not in the curated list: Nominatim online + on-disk cache) and mission
 manager (curated destinations).
 
 Usage:
   ros2 launch guide_bringup mission.launch.py
   ros2 launch guide_bringup mission.launch.py rviz:=true
   ros2 launch guide_bringup mission.launch.py start_x:=... start_y:=... start_yaw_deg:=...
+  ros2 launch guide_bringup mission.launch.py online_lookup:=false   # never go online
 
 Then, in another terminal:
   ros2 action send_goal --feedback /guide/navigate_to guide_interfaces/action/NavigateTo \
@@ -58,6 +60,14 @@ def generate_launch_description():
             'destinations_file',
             default_value=PathJoinSubstitution([share, 'destinations', 'campus.yaml']),
             description='Curated destination list for the mission manager'),
+        # Online lookup of names not in the curated list (Nominatim usage policy:
+        # https://operations.osmfoundation.org/policies/nominatim/). 'false' = the
+        # geocoder never goes online; places already in its cache still work.
+        DeclareLaunchArgument('online_lookup', default_value='true',
+                              description="'false' switches online search off"),
+        DeclareLaunchArgument(
+            'geocode_cache_file', default_value='~/.local/share/navigoat/geocode_cache.json',
+            description='Saved online answers (kept outside the workspace; survives updates)'),
         DeclareLaunchArgument('rviz', default_value='false',
                               description="'true' also starts RViz"),
     ]
@@ -91,6 +101,17 @@ def generate_launch_description():
     route_planner = Node(
         package='guide_nodes', executable='route_planner', output='screen',
         parameters=[{'graph_file': LaunchConfiguration('graph_file'), **origin}])
+    # The geocoder reads only the small .meta.yaml next to graph_file (the area
+    # to search in). ParameterValue(..., value_type=bool) turns 'true'/'false'
+    # into a real bool, as the node declares online_enabled as a bool.
+    geocoder = Node(
+        package='guide_nodes', executable='geocoder', output='screen',
+        parameters=[{
+            'graph_file': LaunchConfiguration('graph_file'),
+            'cache_file': LaunchConfiguration('geocode_cache_file'),
+            'online_enabled': ParameterValue(LaunchConfiguration('online_lookup'),
+                                             value_type=bool),
+        }])
     mission_manager = Node(
         package='guide_nodes', executable='mission_manager', output='screen',
         parameters=[{'destinations_file': LaunchConfiguration('destinations_file'),
@@ -110,6 +131,7 @@ def generate_launch_description():
         route_follower,
         goal_sender,
         route_planner,
+        geocoder,
         mission_manager,
         rviz,
     ])
