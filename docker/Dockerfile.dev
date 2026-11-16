@@ -79,5 +79,5 @@ RUN if [ "$SOCIAL" = "true" ]; then \
             torch torchvision --index-url "$PEOPLE_TORCH_INDEX_URL" && \
         /opt/people_env/bin/python -m pip install --no-cache-dir \
             "numpy<2" scipy ultralytics git+https://github.com/ultralytics/CLIP.git && \
-        /opt/people_env/bin/python -c "import torch, torchvision, cv_bridge, message_filters, rclpy; print('Social PyTorch:', torch.__version__, 'CUDA:', torch.version.cuda)"; \
-    fi
+        /bin/bash -c 'source /opt/ros/jazzy/setup.bash && /opt/people_env/bin/python -c "import torch, torchvision, cv_bridge, message_filters, rclpy; print(torch.__version__, torch.version.cuda)"'; \
+        fi
