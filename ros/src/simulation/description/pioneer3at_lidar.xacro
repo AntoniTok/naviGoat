@@ -1,83 +1,61 @@
 <?xml version="1.0"?>
 <robot xmlns:xacro="http://ros.org/wiki/xacro" name="pioneer3at">
-  <xacro:include filename="$(find p2os_urdf)/defs/pioneer3at.xacro"/>
+  <xacro:include filename="../../bringup/description/pioneer3at_lidar.xacro"/>
 
-  <link name="lidar_link">
-    <inertial>
-      <mass value="0.1"/>
-      <inertia ixx="0.0001" ixy="0" ixz="0" iyy="0.0001" iyz="0" izz="0.000125"/>
-    </inertial>
-    <visual>
-      <geometry>
-        <cylinder radius="0.05" length="0.06"/>
-      </geometry>
-      <material name="lidar_grey">
-        <color rgba="0.2 0.2 0.2 1"/>
-      </material>
-    </visual>
-    <visual>
-      <origin xyz="0 0 -0.15"/>
-      <geometry>
-        <cylinder radius="0.01" length="0.3"/>
-      </geometry>
-      <material name="mount_grey">
-        <color rgba="0.4 0.4 0.4 1"/>
-      </material>
-    </visual>
-  </link>
-
-  <joint name="top_plate_lidar_joint" type="fixed">
-    <origin xyz="0 0 0.3" rpy="0 0 0"/>
-    <parent link="top_plate"/>
-    <child link="lidar_link"/>
-  </joint>
-
-  <!-- Femto Bolt depth camera. The pose is a guess, at the front of the top plate, level and looking forward. Measure
-       it on the robot and change it here and in the other pioneer3at_lidar.xacro (simulation/description and
-       bringup/description). camera_link is x forward, y left, z up, the way perception and the people tracker give
-       positions relative to the camera. -->
-  <!-- Only a frame, with no visual. In Gazebo the lidar sees any visual on the robot, and a box here was an obstacle
-       inside the footprint, so the collision monitor stopped every command from Nav2. -->
-  <link name="camera_link">
-    <inertial>
-      <mass value="0.1"/>
-      <inertia ixx="0.0001" ixy="0" ixz="0" iyy="0.0001" iyz="0" izz="0.0001"/>
-    </inertial>
-  </link>
-
-  <joint name="top_plate_camera_joint" type="fixed">
-    <origin xyz="0.20 0 0.10" rpy="0 0 0"/>
-    <parent link="top_plate"/>
-    <child link="camera_link"/>
-  </joint>
-
-  <gazebo reference="lidar_link">
+  <gazebo reference="unilidar_lidar">
     <sensor name="lidar" type="gpu_lidar">
       <always_on>true</always_on>
-      <update_rate>10</update_rate>
+      <update_rate>11</update_rate>
       <topic>/lidar</topic>
-      <gz_frame_id>lidar_link</gz_frame_id>
+      <gz_frame_id>unilidar_lidar</gz_frame_id>
       <lidar>
         <scan>
           <horizontal>
-            <samples>720</samples>
+            <samples>120</samples>
             <resolution>1</resolution>
             <min_angle>-3.14159</min_angle>
             <max_angle>3.14159</max_angle>
           </horizontal>
           <vertical>
-            <samples>32</samples>
+            <samples>16</samples>
             <resolution>1</resolution>
-            <min_angle>-0.7854</min_angle>
-            <max_angle>0.7854</max_angle>
+            <min_angle>0</min_angle>
+            <max_angle>1.5708</max_angle>
           </vertical>
         </scan>
         <range>
-          <min>0.1</min>
-          <max>12</max>
+          <min>0.05</min>
+          <max>30</max>
           <resolution>0.01</resolution>
         </range>
       </lidar>
+    </sensor>
+  </gazebo>
+
+  <gazebo reference="camera_link">
+    <sensor name="femto_bolt" type="rgbd_camera">
+      <always_on>true</always_on>
+      <update_rate>30</update_rate>
+      <topic>/femto_bolt</topic>
+      <gz_frame_id>camera_link</gz_frame_id>
+      <camera>
+        <horizontal_fov>1.3962634</horizontal_fov>
+        <image>
+          <width>1280</width>
+          <height>720</height>
+        </image>
+        <clip>
+          <near>0.05</near>
+          <far>100</far>
+        </clip>
+        <depth_camera>
+          <clip>
+            <near>0.5</near>
+            <far>3.86</far>
+          </clip>
+        </depth_camera>
+        <optical_frame_id>camera_color_optical_frame</optical_frame_id>
+      </camera>
     </sensor>
   </gazebo>
 

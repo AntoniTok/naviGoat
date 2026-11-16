@@ -20,10 +20,13 @@ source install/setup.bash
 ```
 
 ### Setup Details
+
 Follow the [container setup](../../../../README.md#setup). Identify serial ports:
+
 ```bash
 ls -l /dev/ttyUSB*
 ``` 
+
 Add these flags when creating the docker container, replacing USB paths as needed:
 
 ```bash
@@ -31,12 +34,21 @@ Add these flags when creating the docker container, replacing USB paths as neede
 ```
 
 ## Run
+
 ```bash
 ros2 launch /workspace/ros/src/autonomy/slam/launch/mapping.launch.py
 ```
 
+With Femto Bolt camera:
+
+```bash
+ros2 launch /workspace/ros/src/autonomy/slam/launch/mapping.launch.py use_rgbd:=true start_camera:=true
+```
+
 For a lidar-only test without the base, pass only the lidar device into Docker and run:
+
 ```bash
 ros2 launch /workspace/ros/src/autonomy/slam/launch/lidar_test.launch.py
 ```
+
 Movement and drift testing can be done with `odometry:=icp`.

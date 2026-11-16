@@ -60,4 +60,11 @@ def generate_launch_description():
             parameters=[{'config_file': os.path.join(simulation_dir, 'config', 'gazebo_bridge.yaml')}],
             output='screen',
         ),
+        Node(
+            package='rtabmap_util',
+            executable='point_cloud_xyz',
+            parameters=[{'use_sim_time': True, 'filter_nans': True}],
+            remappings=[('depth/image', '/camera/depth_registered/image_rect'), ('depth/camera_info', '/camera/color/camera_info'), ('cloud', '/camera/points')],
+            output='screen',
+        ),
     ])

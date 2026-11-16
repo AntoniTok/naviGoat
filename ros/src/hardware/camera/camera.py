@@ -10,7 +10,7 @@ from cv_bridge import CvBridge
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy
-from sensor_msgs.msg import CameraInfo, CompressedImage, Image
+from sensor_msgs.msg import CameraInfo, CompressedImage, Image, PointCloud2, PointField
 
 CAMERA_QOS = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
 
@@ -63,6 +63,7 @@ class Camera(Node):
         self.colour_pub = self.create_publisher(Image, '/camera/color/image_raw', CAMERA_QOS)
         self.depth_pub = self.create_publisher(Image, '/camera/depth_registered/image_rect', CAMERA_QOS)
         self.info_pub = self.create_publisher(CameraInfo, '/camera/color/camera_info', CAMERA_QOS)
+        self.cloud_pub = self.create_publisher(PointCloud2, '/camera/points', CAMERA_QOS)
         # A small jpeg preview to watch from another computer: full frames don't get through a USB or Wi-Fi link
         self.preview_pub = self.create_publisher(CompressedImage, '/camera/color/image_raw/compressed', CAMERA_QOS)
         i = self.camera.intrinsic
@@ -84,6 +85,21 @@ class Camera(Node):
                              (self.bridge.cv2_to_imgmsg(depth, '16UC1'), self.depth_pub), (self.info, self.info_pub), (preview, self.preview_pub)):
                 msg.header.stamp, msg.header.frame_id = stamp, self.frame_id
                 pub.publish(msg)
+            if self.cloud_pub.get_subscription_count():
+                self.cloud_pub.publish(self.point_cloud(depth, stamp))
+
+    def point_cloud(self, depth, stamp):
+        rows, cols = np.nonzero(depth)
+        z = depth[rows, cols].astype(np.float32) / 1000.0
+        i = self.camera.intrinsic
+        points = np.empty(len(z), dtype=[('x', '<f4'), ('y', '<f4'), ('z', '<f4')])
+        points['x'] = (cols - i.cx) * z / i.fx
+        points['y'] = (rows - i.cy) * z / i.fy
+        points['z'] = z
+        fields = [PointField(name=name, offset=offset, datatype=PointField.FLOAT32, count=1) for name, offset in (('x', 0), ('y', 4), ('z', 8))]
+        cloud = PointCloud2(height=1, width=len(points), fields=fields, is_bigendian=False, point_step=points.dtype.itemsize, row_step=points.nbytes, data=points.tobytes(), is_dense=True)
+        cloud.header.stamp, cloud.header.frame_id = stamp, self.frame_id
+        return cloud
 
     def close(self):
         self.running = False

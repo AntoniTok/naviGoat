@@ -22,6 +22,7 @@ def launch_slam(context):
             'database_path': database_path,
             'config_file': os.path.join(slam_dir, 'config', 'rtabmap_sim.yaml'),
             'use_sim_time': 'true',
+            'use_rgbd': 'true',
         }.items(),
     )]
 

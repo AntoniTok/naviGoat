@@ -7,6 +7,7 @@
 | `/camera/color/image_raw` | `sensor_msgs/Image` | colour, `bgr8`, 1280×720 at about 18 fps on the Jetson |
 | `/camera/depth_registered/image_rect` | `sensor_msgs/Image` | depth aligned to colour, `16UC1` in mm, 0 = no reading |
 | `/camera/color/camera_info` | `sensor_msgs/CameraInfo` | colour intrinsics |
+| `/camera/points` | `sensor_msgs/PointCloud2` | XYZ points in metres, published when subscribed |
 | `/camera/color/image_raw/compressed` | `sensor_msgs/CompressedImage` | small 640 px jpeg preview, for watching from another computer |
 
 All are best effort. Colour and depth of a frame share the same timestamp. Perception ([autonomy/perception](../../autonomy/perception)) and the people tracker both use these topics. Only one program can open the camera, so run either this node or the Orbbec ROS 2 driver, not both.
