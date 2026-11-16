@@ -7,7 +7,7 @@ from std_msgs.msg import UInt8MultiArray
 
 
 DEVICE_NAME = 'naviGoatWristband'
-WRITE_CHARACTERISTIC_UUID = 'TBD'
+WRITE_CHARACTERISTIC_UUID = '0bbbe0d1-3a64-4f83-bc35-64314a26cb60'
 RETRY_DELAY_SECONDS = 3
 DIRECTIONS = ('l', 'r', 'f', 'b')
 
@@ -16,8 +16,9 @@ class BleBridge(Node):
     def __init__(self):
         super().__init__('ble_bridge')
         self.connected = False
-        self.latest_frame = None
-        self.create_subscription(UInt8MultiArray, '/wristband/vibration', self.send_vibration, 1)
+        self.pending_frames = {}
+        # Allow a stop followed immediately by a new direction to reach both callbacks.
+        self.create_subscription(UInt8MultiArray, '/wristband/vibration', self.send_vibration, 10)
 
     def send_vibration(self, message):
         if len(message.data) != 2:
@@ -32,14 +33,10 @@ class BleBridge(Node):
         if not self.connected:
             return
 
-        # send only latest command
-        self.latest_frame = f'<{DIRECTIONS[side]}:{magnitude}>'.encode('ascii')
+        # Keep the latest command per side so another side cannot erase a stop.
+        self.pending_frames[side] = f'<{DIRECTIONS[side]}:{magnitude}>'.encode('ascii')
 
     async def run(self):
-        if WRITE_CHARACTERISTIC_UUID == 'TBD': # remove once uuid known
-            self.get_logger().error('Wristband write characteristic UUID is TBD')
-            return
-
         while rclpy.ok():
             try:
                 device = await BleakScanner.find_device_by_name(DEVICE_NAME, timeout=5)
@@ -55,17 +52,17 @@ class BleBridge(Node):
                         if not response and 'write-without-response' not in characteristic.properties:
                             raise RuntimeError('Wristband characteristic is not writable')
 
-                        self.latest_frame = None
+                        self.pending_frames.clear()
                         self.connected = True
                         self.get_logger().info(f'Connected to {DEVICE_NAME}')
 
                         while client.is_connected and rclpy.ok():
-                            frame = self.latest_frame
-                            self.latest_frame = None
-                            if frame is None:
+                            if not self.pending_frames:
                                 await asyncio.sleep(0.05)
                                 continue
 
+                            side = next(iter(self.pending_frames))
+                            frame = self.pending_frames.pop(side)
                             await client.write_gatt_char(characteristic, frame, response=response)
 
             except Exception as error:
@@ -74,7 +71,7 @@ class BleBridge(Node):
                 if self.connected:
                     self.get_logger().warning('Wristband disconnected')
                 self.connected = False
-                self.latest_frame = None
+                self.pending_frames.clear()
 
             if rclpy.ok():
                 await asyncio.sleep(RETRY_DELAY_SECONDS)
