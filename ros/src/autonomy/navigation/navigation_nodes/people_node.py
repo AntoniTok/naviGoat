@@ -1,5 +1,4 @@
-"""Keeps the people around the robot on the map, for the social layer in Nav2's costmaps (social_layer/).
-Started by launch/navigation.launch.py. Its topics are listed in autonomy/navigation/README.md.
+"""Keeps the people around the robot on the map
 
 People come from three places, and are all published together on /people, 10 times a second:
   - Enid's tracker: positions relative to the camera, put on the map with where the camera was when the image was
@@ -21,12 +20,14 @@ import collections  # for deque, a list that is quick to remove things from the 
 import json  # Enid's tracker sends JSON inside a String
 import math
 import signal  # only used at the very end, to stop cleanly
+import threading  # to listen to the tracker on another ROS domain, see relay_tracks_from()
 
 import numpy as np  # for the line fit that gives the walking speed
 import rclpy
 import yaml  # the fake people file
 from geometry_msgs.msg import Point, PointStamped
 from navigoat_msgs.msg import People, Person  # our own messages, see navigoat_msgs/msg/
+from rclpy.executors import ExternalShutdownException, SingleThreadedExecutor
 from rclpy.node import Node
 from rclpy.time import Time
 from std_msgs.msg import String
@@ -109,6 +110,9 @@ class PeopleNode(Node):
         self.track_timeout = self.declare_parameter('track_timeout', 0.5).value  # s: then a walker we lost is dropped
         self.remember_for = self.declare_parameter('remember_for', 3.0).value  # s: how long standing people are kept
         self.standing, self.walking = load_fake_people(self.declare_parameter('fake_people', 'none').value)
+        # -1: the tracker is on our ROS domain. otherwise the domain it's on (see relay_tracks_from)
+        tracker_domain = self.declare_parameter('tracker_domain', -1).value
+        self.relay_context = None  # set by relay_tracks_from() when the tracker is on another domain
 
         self.tracks = {}  # tracker id -> Track
         self.clicked = {}  # id (negative) -> (x, y), the people added in RViz
@@ -123,10 +127,55 @@ class PeopleNode(Node):
         # what we listen to: Enid's tracker, and clicks in RViz
         self.create_subscription(String, '/social_perception/tracks', self.on_tracks, 10)
         self.create_subscription(PointStamped, '/clicked_point', self.on_click, 10)
+        if tracker_domain >= 0:
+            self.relay_tracks_from(tracker_domain)
         # publish everyone 10 times a second (every 0.1 s)
         self.create_timer(0.1, self.publish)
         self.get_logger().info(f'People ready: {len(self.standing)} standing and {len(self.walking)} walking fake '
                                'people. Click in RViz with "Publish Point" to add or remove one.')
+
+    def relay_tracks_from(self, domain):
+        """Listen to Enid's tracker on another ROS domain, and pass its messages on to /social_perception/tracks here.
+
+        For real people on the simulated map (navigation_sim.launch.py real_people:=true): the simulation then runs on its
+        own domain, so the real camera's /camera/... images, which are on the tracker's domain, don't mix with Gazebo's."""
+        if domain == self.context.get_domain_id():
+            return  # it's our own domain: the normal subscription already gets the tracks
+        # a second, separate ROS "connection" on the tracker's domain, with one node that only listens to the tracks
+        self.relay_context = rclpy.Context()
+        rclpy.init(context=self.relay_context, domain_id=domain)
+        listener = rclpy.create_node('people_tracks_listener', context=self.relay_context)
+        # each message it gets is published again here, where our own on_tracks subscription picks it up
+        relay = self.create_publisher(String, '/social_perception/tracks', 10)
+
+        def forward(msg):
+            try:
+                relay.publish(msg)
+            except Exception:
+                pass  # we're stopping (Ctrl+C) and our side is already closed: nothing to forward to
+
+        listener.create_subscription(String, '/social_perception/tracks', forward, 10)
+        # that node needs its own spin, next to rclpy.spin(node) in main(): a background thread does it
+        self.relay_executor = SingleThreadedExecutor(context=self.relay_context)
+        self.relay_executor.add_node(listener)
+
+        def spin():
+            try:
+                self.relay_executor.spin()
+            except ExternalShutdownException:
+                pass  # Ctrl+C or the launch file stopping us closed this connection too: a normal stop
+
+        self.relay_thread = threading.Thread(target=spin)
+        self.relay_thread.start()
+        self.get_logger().info(f'Listening to the people tracker on ROS domain {domain}.')
+
+    def stop_relay(self):
+        """Stop the thread of relay_tracks_from(), if there is one. Without this, the program crashes when it stops."""
+        if self.relay_context is None:
+            return
+        self.relay_executor.shutdown(timeout_sec=1.0)  # makes its spin() return
+        self.relay_thread.join(timeout=1.0)  # wait for the thread to finish
+        self.relay_context.try_shutdown()  # and close the connection to the tracker's domain
 
     def seconds(self):
         # the time now, in seconds (in Gazebo this is the simulation's time)
@@ -264,6 +313,8 @@ def main():
         signal.signal(signal.SIGINT, signal.SIG_IGN)  # ros2 launch sends Ctrl+C a second time: ignore it
         if rclpy.ok():  # ROS is still running, so this is a real error: show it
             raise
+    finally:
+        node.stop_relay()  # however we stop, stop the tracker listener too (see relay_tracks_from)
 
 
 # this runs main() when the file is started with: python3 people_node.py
