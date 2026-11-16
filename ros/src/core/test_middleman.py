@@ -180,7 +180,9 @@ class ClassifyTest(unittest.TestCase):
         for text in ('take me to the bathroom', 'follow alice', 'manual mode', 'stop', 'take me to the unicorn', 'where is the cup'):
             bot.handle(text)
         self.assertEqual(beeps, [])
-        bot.handle("what's in front of me")
+        described = bot.handle("what's in front of me")  # said at once ("Describing the scene."), so no beep
+        self.assertEqual((described.reply, described.forward, beeps), ('Describing the scene.', "what's in front of me", []))
+        bot.handle('is the light on')  # a camera question with nothing to say yet: perception answers later, so beep
         self.assertEqual(beeps, [1])
 
     def test_wake_word_required(self):

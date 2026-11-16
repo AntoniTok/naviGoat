@@ -337,7 +337,7 @@ def find_target(text, patterns):
 
 
 # Something the person needs, as opposed to a question about what the camera sees.
-_NEED = re.compile(r"\b(i'd like|i would like|i need|i want|somewhere to|i'm (thirsty|hungry)|i am (thirsty|hungry))\b")
+_NEED = re.compile(r"\b(i'd like|i would like|i need|i want|somewhere to|something to (eat|drink)|i'm (thirsty|hungry)|i am (thirsty|hungry))\b")
 
 
 def classify_by_rules(text, locations=LOCATIONS, require_wake_word=False, saved=None):
