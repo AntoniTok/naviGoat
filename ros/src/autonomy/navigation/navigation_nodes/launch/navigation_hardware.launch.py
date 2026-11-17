@@ -1,4 +1,4 @@
-"""Starts Pioneer hardware, saved map localisation, Nav2 and navigation feedback."""
+"""Starts Pioneer hardware, mapping or localisation, Nav2 and navigation feedback."""
 
 import os
 
@@ -18,9 +18,10 @@ SLAM_DIR = os.path.join(os.path.dirname(NAVIGATION_DIR), 'slam')
 
 
 def launch_hardware(context):
+    mode = LaunchConfiguration('mode').perform(context)
     database_path = os.path.abspath(os.path.expanduser(LaunchConfiguration('database_path').perform(context)))
-    if not os.path.isfile(database_path):
-        raise RuntimeError(f'No saved map at {database_path}. Create it with mapping.launch.py first.')
+    if mode == 'localisation' and not os.path.isfile(database_path):
+        raise RuntimeError(f'No saved map at {database_path}. Use mode:=mapping to create it.')
 
     places_file = LaunchConfiguration('places_file').perform(context)
     if not places_file:
@@ -30,7 +31,7 @@ def launch_hardware(context):
         'pioneer_port', 'lidar_port', 'lidar_x', 'lidar_y', 'lidar_z', 'lidar_roll', 'lidar_pitch', 'lidar_yaw',
         'start_base', 'start_lidar', 'start_camera', 'use_rgbd', 'filter_dynamic_objects', 'initial_pose',
     )}
-    hardware_arguments.update({'mode': 'localisation', 'database_path': database_path, 'odom_frame_id': 'odom', 'rviz': 'false'})
+    hardware_arguments.update({'mode': mode, 'database_path': database_path, 'odom_frame_id': 'odom', 'rviz': 'false'})
 
     return [
         IncludeLaunchDescription(
@@ -78,7 +79,8 @@ def launch_hardware(context):
 
 def generate_launch_description():
     return LaunchDescription([
-        DeclareLaunchArgument('database_path', description='Saved hardware RTAB-Map database'),
+        DeclareLaunchArgument('mode', default_value='localisation', choices=['mapping', 'localisation']),
+        DeclareLaunchArgument('database_path', description='Hardware RTAB-Map database to create or load'),
         DeclareLaunchArgument('places_file', default_value='', description='Defaults to <database stem>_places.yaml'),
         DeclareLaunchArgument('params_file', default_value=os.path.join(NAVIGATION_DIR, 'config', 'nav2_params.yaml')),
         DeclareLaunchArgument('initial_pose', default_value='0 0 0 0 0 0', description='Initial map pose: x y z roll pitch yaw'),
