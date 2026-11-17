@@ -11,7 +11,8 @@ Modes (the middleman only handles going somewhere, following, and stopping):
     "help"                           -> HELP
 
 Going to a location, object or GPS destination ends by itself: the code that drives it calls finish() on arrival.
-Following and manual mode have no goal, so they only end when the user says stop or exits the mode.
+Following and manual mode have no arrival goal. Both end on user stop; following
+also ends on correlated target-loss or input-failure feedback.
 
 "Remember this place as X" saves where the robot is now: the node publishes X on /navigation/save_place (navigation's
 places_node stores the position). places_node then sends all saved names back on /navigation/places, and
@@ -44,7 +45,8 @@ import sys
 import threading
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+import uuid
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
 
@@ -72,6 +74,7 @@ class Decision:
     reply: str = ''  # what Pete says out loud
     forward: str = ''  # the full text for perception (what the camera sees); mode is None
     save_place: str = ''  # "remember this place as the study": the name for navigation to save the robot's position under; mode is None
+    request_id: str = field(default='', compare=False)  # correlate commands and following feedback
 
 
 WAKE_WORDS = ('hey pete', 'ok pete', 'pete')
@@ -466,12 +469,43 @@ class Middleman:
                 return decision  # stay in the current mode: speak the reply, or send the text to perception
             if decision.stop:
                 decision.reply = LEAVING_REPLIES.get(self.mode, decision.reply)
+            decision.request_id = uuid.uuid4().hex
             self.mode, self.current = decision.mode, decision
+            return decision
+
+    def following_status(self, payload):
+        """End only the FOLLOW request named by terminal status feedback.
+
+        Ignore progress, duplicates, standalone statuses and older requests.
+        Return an idle Decision for the ROS wrapper to announce and speak.
+        """
+        replies = {
+            'target_lost': 'I lost the person. Following stopped.',
+            'input_stale': 'Person tracking stopped updating. Following stopped.',
+            'input_fault': 'There is a problem with person tracking. Following stopped.',
+            'unsupported_target': 'Following a named contact is not available yet.',
+            'command_invalid': 'The following command was invalid. Following stopped.',
+            'disabled': 'Stopped following.',
+        }
+        if not isinstance(payload, dict):
+            return None
+        event = payload.get('event')
+        request_id = payload.get('request_id')
+        if (payload.get('state') != 'IDLE' or not isinstance(event, str)
+                or event not in replies or not isinstance(request_id, str) or not request_id):
+            return None
+        with self._lock:
+            if (self.mode is not Mode.FOLLOW or self.current is None
+                    or request_id != self.current.request_id):
+                return None
+            self._epoch += 1  # invalidate an earlier slow interpretation
+            decision = Decision(Mode.IDLE, reply=replies[event], request_id=uuid.uuid4().hex)
+            self.mode, self.current = Mode.IDLE, decision
             return decision
 
     def finish(self):
         """The active mode reached its goal. LOCATION, OBJECT and GPS have a goal, so whoever drives them calls this
-        on arrival. FOLLOW and MANUAL have no goal, so they only end when the user says stop or exits the mode."""
+        on arrival. FOLLOW uses following_status() for failures; MANUAL ends on user stop."""
         with self._lock:
             self.mode, self.current = Mode.IDLE, None
 

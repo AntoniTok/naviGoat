@@ -2,8 +2,9 @@
 
 The following logic and dummy demo use only the Python standard library (Python
 3.9 or newer). A separate ROS runner can consume Enid's live tracks on the Jetson
-and print hypothetical velocity commands. It creates no publishers and sends no
-drive commands. No robot is needed for the camera test.
+and print hypothetical velocity commands. It receives middleman mode commands
+and publishes following status, but sends no drive commands. No robot is needed
+for the camera test.
 
 ## Run the demo
 
@@ -62,7 +63,8 @@ degrees or more it requests turning in place. These are initial test parameters.
 
 Same-ID resumption assumes the upstream tracker associated the person correctly.
 Before moving-robot integration, address Enid's stationary-camera tracking
-assumption. Drive-command routing and Lia's status interface remain future work.
+assumption. Drive-command routing remains future work; the middleman connection
+is implemented below but still needs live ROS verification.
 
 ## Live Jetson + camera test
 
@@ -73,7 +75,8 @@ Femto Bolt → Enid's ROS camera + depth registration
            → ONE YOLO-World detector + Kalman tracker
            → /social_perception/tracks (JSON in std_msgs/String)
            → perception_adapter.py → state_machine.py → velocity_controller.py
-           → ros_camera_test.py prints velocities, positions and status
+           → ros_camera_test.py prints velocities and positions
+                               ↔ middleman mode commands / following status
 ```
 
 Enid's eight files under `enid/social_perception/` and `docker_enid/Dockerfile`
@@ -88,10 +91,18 @@ New integration files:
   timestamps to monotonic time while preserving processing delay. Duplicate
   results cannot refresh the watchdog. Predicted tracks stay unobserved.
 - `ros_camera_test.py`: subscribes with a one-message queue, runs control at
-  20 Hz using a steady timer, logs outputs, and exposes an enable/disable service.
-  It does not load a detector or publish velocities/status to other modules.
+  20 Hz using a steady timer, logs outputs, exposes an enable/disable service,
+  receives `/middleman/mode`, and publishes `/person_following/status`. It does
+  not load a detector or publish drive velocities.
+- `mode_bridge.py`: validates middleman commands, retains the selected person
+  across repeated follow commands, rejects named contacts, and echoes request IDs
+  in feedback. This module has no ROS dependency and is tested on the laptop.
 - `run_camera_test.sh`: starts Enid's unchanged camera/tracker/dashboard pipeline
-  and the console runner. It sets `TRACK_MAX_AGE=2.0` to match our loss window.
+  and the console runner. It starts idle by default for voice/middleman control;
+  pass `--enable-on-start` explicitly for a standalone camera test. It sets
+  `TRACK_MAX_AGE=2.0` to match our loss window.
+  It defaults `DASHBOARD_PORT` to `8766`, leaving `8765` for the voice pipeline's
+  Whisper server. An explicit `DASHBOARD_PORT` environment value is preserved.
   It temporarily relaxes unset-variable checking while sourcing ROS setup,
   restores strict checking afterwards, and aborts if setup fails.
 - `docker/Dockerfile.following-test`: adds explicit ROS registration/runner
@@ -138,12 +149,12 @@ sudo docker run --rm -it --init --name navigoat-following-test \
   -v /run/udev:/run/udev:ro \
   -v "$PWD:/workspace" \
   navigoat:following-test \
-  bash /workspace/ros/src/autonomy/person_following/run_camera_test.sh
+  bash /workspace/ros/src/autonomy/person_following/run_camera_test.sh --enable-on-start
 ```
 
 This starts the camera driver, depth registration, person detector/tracker,
 Enid's local dashboard, and our console runner. Ctrl+C stops the stack. The
-console runner starts enabled, waits for a confirmed person, and logs commands
+console runner starts enabled with this explicit flag, waits for a confirmed person, and logs commands
 twice per second plus state events. Wait for model startup before testing.
 
 Typical output:
@@ -161,8 +172,9 @@ sudo docker exec navigoat-following-test bash -c \
   'source /opt/ros/jazzy/setup.bash && ros2 service call /person_following/set_enabled std_srvs/srv/SetBool "{data: true}"'
 ```
 
-Use `{data: false}` to disable. No events are sent to Lia yet; the runner prints
-them locally for this test.
+Use `{data: false}` to disable. Standalone sessions publish status with a null
+request ID, so the middleman ignores them. Voice sessions echo the request ID
+from the middleman's command and can update its mode when following ends.
 
 If Enid's pipeline is already running in a compatible ROS environment, start
 **only** the subscriber there, with this full checkout available:
@@ -179,9 +191,76 @@ must use the same ROS system clock as the runner; the adapter rejects future or
 stale capture times rather than guessing a clock offset. Simulation/bag time is
 not configured by this live launcher.
 
-The dashboard listens on `127.0.0.1:8765` by default. To view it from your laptop,
-forward that port over SSH to your Jetson and open `http://localhost:8765`.
+Through our launcher, the dashboard listens on `127.0.0.1:8766` by default. To
+view it from your laptop, forward port `8766` over SSH to your Jetson and open
+`http://localhost:8766`. Whisper can continue using `127.0.0.1:8765`.
 It shows tracking, while following commands appear in the terminal.
+
+### Lia's voice/middleman connection
+
+The following runner now implements both directions of the interface:
+
+| Direction | Topic | Message |
+| --- | --- | --- |
+| Middleman → following | `/middleman/mode` | `std_msgs/String` JSON: `mode`, `target`, `intent`, `stop`, `request_id` |
+| Following → middleman | `/person_following/status` | `std_msgs/String` JSON: `request_id`, `state`, `event`, `target_id` |
+| Middleman → voice | `/pete/response` | Existing spoken-response text |
+
+An empty-target follow command enables nearest-person acquisition. Stop or any
+other mode disables immediately. Repeating a follow request while active keeps
+the selected person. A new command after timeout can acquire again. Named
+contacts are rejected rather than silently selecting someone else.
+
+Each middleman mode decision has a unique `request_id`; following echoes it in
+status messages. Matching terminal target-loss, stale-input, input-fault or
+unsupported-contact events return the middleman to idle and produce a spoken
+explanation. Acquisition/progress events do not end a mode. Reports from older
+sessions, duplicate failures and standalone tests are ignored. `/middleman/done`
+is not used for following, so losing someone never announces "Arrived".
+
+Both the following runner AND the middleman must run the updated code from this
+branch. Older middleman follow commands without a request ID are rejected. The
+extra JSON field is ignored by the navigation consumer. Status is sent on events
+and about twice per second while the runner is alive; the middleman currently
+does not implement a separate watchdog for the runner process dying entirely.
+
+For a typed-command integration test on the Jetson:
+
+1. Start the camera stack using the Docker command above, but **omit**
+   `--enable-on-start`. It should remain IDLE until a mode command arrives.
+2. In another Jetson terminal, launch the middleman inside that same container:
+
+   ```bash
+   sudo docker exec -it navigoat-following-test bash -c \
+     'source /opt/ros/jazzy/setup.bash && ros2 launch /workspace/ros/src/core/launch/middleman.launch.py use_qwen:=false'
+   ```
+
+3. In another terminal, enter the container and source ROS:
+
+   ```bash
+   sudo docker exec -it navigoat-following-test bash
+   source /opt/ros/jazzy/setup.bash
+   ```
+
+   Inject typed speech requests:
+
+   ```bash
+   ros2 topic pub --once /speech/text std_msgs/msg/String "{data: 'pete start following'}"
+   ros2 topic pub --once /speech/text std_msgs/msg/String "{data: 'pete stop following'}"
+   ros2 topic pub --once /speech/text std_msgs/msg/String "{data: 'pete manual mode'}"
+   ```
+
+   Observe `/middleman/mode`, `/person_following/status` or `/pete/response` in a
+   separate terminal using `ros2 topic echo TOPIC`. After acquiring a person,
+   leave the frame for two seconds: both following and the middleman should
+   return to idle, with a target-loss response. No drive commands are sent.
+
+For actual microphone testing, use Lia's ROS voice launcher,
+`ros/src/interaction/voice/start_voice_ros.sh`, instead of starting a second
+middleman. Her voice launch already includes one. Ensure its container mounts
+this updated checkout (its script defaults to `~/naviGoat`) and uses the same
+ROS domain as the following container. Her non-ROS `start_voice.sh` only runs the
+standalone listener and does not provide these ROS commands.
 
 ### Camera-test checks and current limits
 

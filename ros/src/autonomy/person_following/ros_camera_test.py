@@ -1,17 +1,20 @@
 """ROS camera-only test: subscribe to tracks and PRINT hypothetical velocities.
 
-This runner creates no publishers and cannot send commands to a robot.
-Enable using --enable-on-start or /person_following/set_enabled (SetBool).
+Receives /middleman/mode and publishes /person_following/status. Velocities are
+printed only; no drive topic is published. Starts idle unless --enable-on-start
+is given for a standalone test. /person_following/set_enabled remains available.
 Run --help on any laptop; ROS imports are deferred until running the live test.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import time
 
 from perception_adapter import PerceptionAdapter, PerceptionError
+from mode_bridge import FollowingModeBridge, ModeCommandError
 from state_machine import FollowingConfig, FollowingStateMachine
 from velocity_controller import ControllerConfig, VelocityController
 
@@ -26,6 +29,8 @@ def positive_number(text):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--topic", default="/social_perception/tracks")
+    parser.add_argument("--mode-topic", default="/middleman/mode")
+    parser.add_argument("--status-topic", default="/person_following/status")
     parser.add_argument("--enable-on-start", action="store_true")
     parser.add_argument("--following-distance", type=positive_number, default=1.0)
     parser.add_argument("--input-timeout", type=positive_number, default=0.5)
@@ -55,6 +60,7 @@ def main():
         def __init__(self):
             super().__init__("person_following_camera_test")
             self.machine = FollowingStateMachine(controller, config)
+            self.mode_bridge = FollowingModeBridge(self.machine)
             self.adapter = PerceptionAdapter(config.input_timeout_s)
             self.pending = None
             self.latest = None
@@ -62,6 +68,8 @@ def main():
             self.last_error_log = float("-inf")
             qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
             self.create_subscription(String, args.topic, self.on_tracks, qos)
+            self.create_subscription(String, args.mode_topic, self.on_mode, 10)
+            self.status_pub = self.create_publisher(String, args.status_topic, 10)
             self.create_service(SetBool, "/person_following/set_enabled", self.on_enable)
             # The watchdog must keep running independently of sensor messages
             # and ROS time (which may be paused or adjusted).
@@ -69,13 +77,23 @@ def main():
             self.create_timer(1.0 / args.control_hz, self.tick, clock=self.steady_clock)
             self.get_logger().info(
                 f"Camera-only test: subscribing to {args.topic}; NO velocity publishers. "
+                f"Mode input: {args.mode_topic}; status output: {args.status_topic}. "
                 "Keep the camera stationary and level. Enable service: /person_following/set_enabled")
             if args.enable_on_start:
-                self.report(self.machine.enable(), time.monotonic())
+                self.report(self.mode_bridge.set_enabled(True), time.monotonic())
+
+        def on_mode(self, msg):
+            self.pending = None
+            try:
+                output = self.mode_bridge.handle_command(msg.data)
+            except ModeCommandError as exc:
+                output = self.mode_bridge.reject_command()
+                self.get_logger().error(f"Rejected mode command: {exc}")
+            self.report(output, time.monotonic())
 
         def on_enable(self, request, response):
             self.pending = None
-            output = self.machine.enable() if request.data else self.machine.disable()
+            output = self.mode_bridge.set_enabled(request.data)
             self.report(output, time.monotonic())
             response.success = True
             response.message = f"{output.state.value}; camera test only, no drive output"
@@ -108,6 +126,7 @@ def main():
             if output.event is None and now - self.last_log < 0.5:
                 return
             self.last_log = now
+            self.status_pub.publish(String(data=json.dumps(self.mode_bridge.status_payload(output))))
             position = "-"
             age = "-"
             if self.latest is not None:
@@ -129,7 +148,8 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
-        node.report(node.machine.disable(), time.monotonic())
+        if rclpy.ok():
+            node.report(node.machine.disable(), time.monotonic())
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()

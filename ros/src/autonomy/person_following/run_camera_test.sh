@@ -24,6 +24,9 @@ python3 -c 'import rclpy, cv_bridge, message_filters, std_srvs.srv, scipy, ultra
 # Enid's one-second default would expire IDs before our two-second loss window.
 export TRACK_MAX_AGE=2.0
 export DASHBOARD_HOST="${DASHBOARD_HOST:-127.0.0.1}"
+# Whisper's GPU server uses 8765 on the host network. Give the dashboard its own
+# default port; Enid's existing pipeline reads this exported override.
+export DASHBOARD_PORT="${DASHBOARD_PORT:-8766}"
 
 pids=()
 cleanup() {
@@ -37,7 +40,9 @@ trap 'exit 143' TERM
 
 bash "$PIPELINE" &
 pids+=("$!")
-python3 -B -u "$APP_DIR/ros_camera_test.py" --enable-on-start &
+# Default is idle for middleman/voice control. Pass --enable-on-start explicitly
+# only for a standalone camera test; other runner arguments are forwarded too.
+python3 -B -u "$APP_DIR/ros_camera_test.py" "$@" &
 pids+=("$!")
 
 echo 'Camera-only following test started. No drive commands are published.'
