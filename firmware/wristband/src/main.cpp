@@ -8,6 +8,8 @@ using namespace wristband;
 
 // Standalone wiring check, matching the original motor test. No BLE required.
 void setup() {
+    Serial.begin(115200);
+    Serial.println("[wristband] motor test starting, BLE disabled");
     for (int pin : kMotorPins) {
         pinMode(pin, OUTPUT);
         digitalWrite(pin, LOW);
@@ -53,6 +55,7 @@ class ServerCallbacks : public BLEServerCallbacks {
         }
         connected = true;
         portEXIT_CRITICAL(&stateMux);
+        Serial.println("[wristband] BLE connected");
     }
 
     void onDisconnect(BLEServer*) override {
@@ -63,6 +66,7 @@ class ServerCallbacks : public BLEServerCallbacks {
         }
         restartAdvertising = true;
         portEXIT_CRITICAL(&stateMux);
+        Serial.println("[wristband] BLE disconnected, motors stopped");
     }
 };
 
@@ -71,6 +75,7 @@ class CommandCallbacks : public BLECharacteristicCallbacks {
         const std::string value = characteristic->getValue();
         VibrationCommand command;
         if (!parseCommand(value.data(), value.size(), command)) {
+            Serial.printf("[wristband] rejected command, %u bytes\n", static_cast<unsigned>(value.size()));
             return;
         }
 
@@ -80,6 +85,7 @@ class CommandCallbacks : public BLECharacteristicCallbacks {
             motors[command.side] = {command.magnitude, now};
         }
         portEXIT_CRITICAL(&stateMux);
+        Serial.printf("[wristband] command: %c:%u\n", kDirections[command.side], static_cast<unsigned>(command.magnitude));
     }
 };
 
@@ -89,6 +95,8 @@ CommandCallbacks commandCallbacks;
 }  // namespace
 
 void setup() {
+    Serial.begin(115200);
+    Serial.println("[wristband] BLE firmware starting");
     for (size_t i = 0; i < kMotorCount; ++i) {
         pinMode(kMotorPins[i], OUTPUT);
         digitalWrite(kMotorPins[i], LOW);
@@ -97,8 +105,10 @@ void setup() {
         ledcAttachPin(kMotorPins[i], i);
     }
 
-    // Keep UART0 free: its RX/TX pins (20/21) drive two of the motors.
+    // keep UART0 free, USB CDC carries debug messages
+    Serial.printf("[wristband] initialising BLE as %s\n", kDeviceName);
     BLEDevice::init(kDeviceName);
+    Serial.println("[wristband] BLE initialised");
     BLEServer* server = BLEDevice::createServer();
     server->setCallbacks(&serverCallbacks);
     BLEService* service = server->createService(kServiceUuid);
@@ -107,6 +117,8 @@ void setup() {
         BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR);
     characteristic->setCallbacks(&commandCallbacks);
     service->start();
+    Serial.printf("[wristband] service started: %s\n", kServiceUuid);
+    Serial.printf("[wristband] write characteristic: %s\n", kWriteCharacteristicUuid);
 
     // A 128-bit service UUID and the full name do not fit in one 31-byte packet.
     BLEAdvertisementData advertisement;
@@ -119,6 +131,7 @@ void setup() {
     advertising->setScanResponseData(scanResponse);
     advertising->setScanResponse(true);
     advertising->start();
+    Serial.println("[wristband] advertising requested");
 }
 
 void loop() {
@@ -142,6 +155,7 @@ void loop() {
     }
     if (advertise) {
         BLEDevice::startAdvertising();
+        Serial.println("[wristband] advertising restart requested");
     }
     delay(5);
 }
