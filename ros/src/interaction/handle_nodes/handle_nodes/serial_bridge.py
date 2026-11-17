@@ -12,7 +12,7 @@ class SerialBridge(Node):
         port = self.get_parameter('port').value
         baud_rate = self.get_parameter('baud_rate').value
         self.connection = serial.Serial(port, baud_rate, write_timeout=1)
-        self.create_subscription(UInt8MultiArray, '/handle/vibration', self.send_vibration, 1)
+        self.create_subscription(UInt8MultiArray, '/handle/vibration', self.send_vibration, 10)
         self.held_publisher = self.create_publisher(Bool, '/handle/held', 1)
         self.receive_buffer = b''
         self.create_timer(0.02, self.receive_touch)

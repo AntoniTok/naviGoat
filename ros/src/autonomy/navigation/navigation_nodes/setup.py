@@ -6,11 +6,11 @@ package_name = 'navigation_nodes'
 setup(
     name=package_name,
     version='0.0.1',
-    py_modules=['places_node', 'people_node', 'feedback_node'],
+    py_modules=['places_node', 'people_node', 'feedback_node', 'cloud_filter'],
     data_files=[
         ('share/ament_index/resource_index/packages', ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
-        ('share/' + package_name + '/launch', ['launch/navigation.launch.py', 'launch/navigation_sim.launch.py']),
+        ('share/' + package_name + '/launch', ['launch/navigation.launch.py', 'launch/navigation_sim.launch.py', 'launch/navigation_hardware.launch.py']),
     ],
     install_requires=['setuptools'],
     maintainer='nihil',
@@ -22,6 +22,7 @@ setup(
             'places_node = places_node:main',
             'people_node = people_node:main',
             'feedback_node = feedback_node:main',
+            'cloud_filter = cloud_filter:main',
         ],
     },
 )

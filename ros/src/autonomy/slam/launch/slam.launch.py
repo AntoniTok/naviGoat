@@ -32,7 +32,7 @@ def launch_rtabmap(context):
         parameters.append({
             'Mem/IncrementalMemory': 'false',
             'Mem/InitWMWithAllNodes': 'true',
-            'initial_pose': '0 0 0 0 0 0',
+            'initial_pose': ParameterValue(LaunchConfiguration('initial_pose'), value_type=str),
         })
 
     remappings = [
@@ -71,6 +71,7 @@ def launch_rtabmap(context):
 def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument('mode', default_value='mapping', choices=['mapping', 'localisation']),
+        DeclareLaunchArgument('initial_pose', default_value='0 0 0 0 0 0'),
         DeclareLaunchArgument('database_path'),
         DeclareLaunchArgument('config_file'),
         DeclareLaunchArgument('use_sim_time', default_value='false'),

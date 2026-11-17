@@ -19,6 +19,8 @@ def generate_launch_description():
                                                 ' lidar_roll:=', LaunchConfiguration('lidar_roll'), ' lidar_pitch:=', LaunchConfiguration('lidar_pitch'), ' lidar_yaw:=', LaunchConfiguration('lidar_yaw')]), value_type=str)
 
     return LaunchDescription([
+        DeclareLaunchArgument('mode', default_value='mapping', choices=['mapping', 'localisation']),
+        DeclareLaunchArgument('initial_pose', default_value='0 0 0 0 0 0'),
         DeclareLaunchArgument('pioneer_port', default_value='/dev/pioneer'),
         DeclareLaunchArgument('lidar_port', default_value='/dev/unilidar'),
         DeclareLaunchArgument('lidar_x', default_value='0'),
@@ -96,6 +98,8 @@ def generate_launch_description():
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(os.path.join(slam_dir, 'launch', 'slam.launch.py')),
             launch_arguments={
+                'mode': LaunchConfiguration('mode'),
+                'initial_pose': LaunchConfiguration('initial_pose'),
                 'database_path': LaunchConfiguration('database_path'),
                 'config_file': os.path.join(slam_dir, 'config', 'rtabmap_hardware.yaml'),
                 'odom_frame_id': LaunchConfiguration('odom_frame_id'),
