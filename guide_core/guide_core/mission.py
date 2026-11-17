@@ -23,6 +23,21 @@ Destinations by name: the curated list first. Only if it has no match, the
 geocoder is asked (LookUpOnline -> on_lookup_result); the state stays
 PLANNING meanwhile ("Searching OpenStreetMap for ..."). An online result is
 always read back in READY and waits for go, even with skip_confirmation.
+
+Localisation and rerouting (Step 8). The localizer's quality (GOOD /
+DEGRADED / LOST, on_localization) and the follower's off_route flag (in
+Progress) are inputs too:
+- DEGRADED while navigating is reported as GPS_DEGRADED: the robot keeps going
+  (the follower already stops earlier); waiting / paused states take priority.
+- LOST pauses the robot (route kept) and reports POSITION_LOST; never in the
+  middle of a crossing (it pauses once off the road). When the position is
+  back the robot stays paused: the user's go resumes, as after any pause.
+- off_route while navigating with GOOD quality: the robot is stopped, the
+  route cleared, a new route planned from where it is (REROUTING) and read
+  back in READY; it starts on the user's go, like any route. At most
+  max_reroutes reroutes without reroute_reset_distance of progress between.
+Without any on_localization call the quality counts as GOOD, so the machine
+behaves exactly as before Step 8.
 """
 
 import math
@@ -33,6 +48,7 @@ from typing import Optional, Tuple
 from guide_core.destinations import (
     Destination, MatchConfig, Outcome, format_distance, resolve,
 )
+from guide_core.localization_quality import Quality
 from guide_core.online_resolve import (
     FOUND_IN_CACHE, FOUND_ONLINE, LARGE_AREA_NOTE, resolve_online,
 )
@@ -49,6 +65,9 @@ class MissionState(IntEnum):
     PAUSED = 5
     ARRIVED = 6
     FAILED = 7
+    GPS_DEGRADED = 8     # navigating, but the position is uncertain (Step 8)
+    POSITION_LOST = 9    # stopped: position too uncertain to guide (Step 8)
+    REROUTING = 10       # stopped off the route, planning a new one (Step 8)
 
 
 class MissionError(IntEnum):
@@ -121,6 +140,7 @@ class Progress:
     waiting_at_crossing: bool = False
     on_crossing: bool = False
     next_crossing_index: int = -1
+    off_route: bool = False
 
 
 @dataclass(frozen=True)
@@ -139,6 +159,9 @@ class MissionConfig:
         no match; False = fail with UNKNOWN_DESTINATION straight away. Off
         here; the mission manager node turns it on (its parameter
         online_lookup, default true).
+    max_reroutes: new routes allowed after leaving the route before the
+        mission fails ("I keep losing the route"); the count starts again after
+        reroute_reset_distance metres of progress.
     """
 
     max_nav_failures: int = 3
@@ -146,11 +169,16 @@ class MissionConfig:
     min_go_interval: float = 1.0
     snap_report_distance: float = 5.0
     online_lookup: bool = False
+    max_reroutes: int = 3
+    reroute_reset_distance: float = 100.0
 
     def __post_init__(self):
         if self.max_nav_failures < 1:
             raise ValueError('max_nav_failures must be >= 1')
-        for name in ('failure_reset_distance', 'min_go_interval', 'snap_report_distance'):
+        if self.max_reroutes < 0:
+            raise ValueError('max_reroutes must be >= 0')
+        for name in ('failure_reset_distance', 'min_go_interval', 'snap_report_distance',
+                     'reroute_reset_distance'):
             if not getattr(self, name) >= 0.0:
                 raise ValueError(f'{name} must be >= 0')
 
@@ -295,6 +323,7 @@ class _Phase(Enum):
     LOOKING_UP = 'looking_up'  # waiting for the geocoder (reported as PLANNING)
     PLANNING = 'planning'
     READY = 'ready'           # planned; waiting for go (or for the follower to accept)
+    REROUTING = 'rerouting'   # left the route: robot stopped, planning a new route
     ACTIVE = 'active'         # the follower has the route
     ARRIVED = 'arrived'
     FAILED = 'failed'
@@ -316,6 +345,7 @@ class Mission:
         self._route_id = 0
         self._phase = _Phase.IDLE
         self._paused = False          # copied from guide/paused (any time)
+        self._quality = Quality.GOOD  # copied from guide/localization_status (any time)
         self._version = 0
         self._reset_mission()
         self._message = ''
@@ -339,16 +369,21 @@ class Mission:
     @property
     def state(self):
         if self._phase is _Phase.ACTIVE:
+            if self._lost_hold:
+                return MissionState.POSITION_LOST
             if self._paused:
                 return MissionState.PAUSED
             if self._waiting:
                 return MissionState.WAITING_AT_CROSSING
+            if self._quality is not Quality.GOOD:
+                return MissionState.GPS_DEGRADED
             return MissionState.NAVIGATING
         return {
             _Phase.IDLE: MissionState.IDLE,
             _Phase.LOOKING_UP: MissionState.PLANNING,
             _Phase.PLANNING: MissionState.PLANNING,
             _Phase.READY: MissionState.READY,
+            _Phase.REROUTING: MissionState.REROUTING,
             _Phase.ARRIVED: MissionState.ARRIVED,
             _Phase.FAILED: MissionState.FAILED,
         }[self._phase]
@@ -359,12 +394,16 @@ class Mission:
 
     def snapshot(self):
         plan = self._plan
+        warnings = plan.warnings if plan else ()
+        if self._phase is _Phase.ACTIVE and self._quality is not Quality.GOOD:
+            warnings += ('position lost' if self._quality is Quality.LOST
+                         else 'GPS signal weak',)
         return Snapshot(
             state=self.state, route_id=self._active_route_id,
             destination_name=self._dest_name, destination_note=self._dest_note,
             route_length=plan.length if plan else 0.0,
             num_crossings=len(plan.crossings) if plan else 0,
-            summary=self._summary, warnings=plan.warnings if plan else (),
+            summary=self._summary, warnings=warnings,
             message=self._message)
 
     # --- goal lifecycle ---
@@ -386,7 +425,7 @@ class Mission:
                   and -180.0 <= goal.longitude <= 180.0):
             return self._fail(MissionError.INVALID_GOAL,
                               'The destination coordinates are not valid.')
-        if robot_latlon is None:
+        if robot_latlon is None or self._quality is Quality.LOST:
             return self._fail(MissionError.NO_POSITION,
                               "I don't know where we are yet, so I can't plan a route.")
 
@@ -434,12 +473,22 @@ class Mission:
 
     def on_plan_result(self, plan_id, success, message, plan=None):
         """The planner answered (plan is a PlanSummary when success is True)."""
-        if self._phase is not _Phase.PLANNING or plan_id != self._plan_id:
+        if (self._phase not in (_Phase.PLANNING, _Phase.REROUTING)
+                or plan_id != self._plan_id):
             return ()  # answer to a cancelled or older request
         if not success:
             return self._fail(MissionError.PLANNING_FAILED,
                               f"I couldn't plan a route: {message}")
         self._plan = plan
+        if self._phase is _Phase.REROUTING:
+            # A new route mid-trip: always read back, always waits for go.
+            summary = build_summary(self._dest_name, self._dest_note, plan,
+                                    self._config.snap_report_distance)
+            self._summary = 'New route: ' + summary.replace('Press go to start.',
+                                                            'Press go to continue.')
+            self._phase = _Phase.READY
+            self._set_message(self._summary)
+            return ()
         self._summary = build_summary(self._dest_name, self._dest_note, plan,
                                       self._config.snap_report_distance,
                                       self._skip_confirmation, self._found_in,
@@ -465,6 +514,8 @@ class Mission:
                               f'The route could not be loaded: {message}')
         self._active_route_id = route_id
         self._phase = _Phase.ACTIVE
+        self._last_remaining = None   # progress is measured afresh on each route
+        self._failures = 0
         self._last_state = MissionState.NAVIGATING
         self._set_message('Setting off.')
         return ()
@@ -496,10 +547,20 @@ class Mission:
             self._resume_pending = False
         return self._after_change()
 
-    def on_progress(self, progress):
-        """A guide/route_progress message (ignored unless it is for our route)."""
+    def on_progress(self, progress, robot_latlon=None):
+        """A guide/route_progress message (ignored unless it is for our route).
+
+        robot_latlon: the robot's (lat, lon) now, needed only to plan a new
+        route when progress.off_route says the robot has left this one.
+        """
         if self._phase is not _Phase.ACTIVE or progress.route_id != self._active_route_id:
             return ()
+        if self._last_remaining is not None and progress.distance_remaining < self._last_remaining:
+            self._travelled += self._last_remaining - progress.distance_remaining
+        self._last_remaining = progress.distance_remaining
+        if self._reroutes and self._travelled - self._reroute_travel \
+                >= self._config.reroute_reset_distance:
+            self._reroutes = 0
         self._distance_remaining = progress.distance_remaining
         self._waiting = progress.waiting_at_crossing
         self._on_crossing = progress.on_crossing
@@ -514,7 +575,17 @@ class Mission:
             message = f'You have arrived at {name}.'
             self._set_message(message)
             return (ClearRoute(), Finish(MissionError.NONE, message, 0.0))
-        return self._after_change()
+        commands = self._check_localization()
+        if progress.off_route and self._can_reroute():
+            return commands + self._reroute(robot_latlon)
+        return commands + self._after_change()
+
+    def on_localization(self, quality):
+        """Take the localizer's quality (GOOD / DEGRADED / LOST) from its status topic."""
+        self._quality = Quality(quality)
+        if self._phase is not _Phase.ACTIVE:
+            return ()
+        return self._check_localization() + self._after_change()
 
     def on_nav_status(self, status, stamp):
         """A guide/goal_status message. stamp: its header time (seconds), used to
@@ -566,8 +637,13 @@ class Mission:
         if state not in (MissionState.READY, MissionState.WAITING_AT_CROSSING,
                          MissionState.PAUSED):
             texts = {MissionState.NAVIGATING: 'Already moving.',
-                     MissionState.PLANNING: 'Still planning, please wait.'}
+                     MissionState.GPS_DEGRADED: 'Already moving.',
+                     MissionState.PLANNING: 'Still planning, please wait.',
+                     MissionState.REROUTING: 'Finding a new route, please wait.',
+                     MissionState.POSITION_LOST: "Waiting for GPS: I can't continue yet."}
             return Reply(False, texts.get(state, 'Nothing to start.'))
+        if state is MissionState.READY and self._quality is Quality.LOST:
+            return Reply(False, "I'm not sure where we are yet. Please wait.")
         if now - self._last_go < self._config.min_go_interval:
             return Reply(False, 'Go pressed twice; the second press was ignored.')
         if state is MissionState.READY:
@@ -631,10 +707,17 @@ class Mission:
         self._last_go = -math.inf
         self._last_status_stamp = -math.inf
         self._last_state = None
+        self._target = None           # the Destination being travelled to
+        self._lost_hold = False       # paused because the position is lost
+        self._reroutes = 0            # new routes since the count last restarted
+        self._travelled = 0.0         # metres of progress on this mission's routes
+        self._reroute_travel = 0.0    # _travelled at the last reroute
+        self._last_remaining = None   # distance_remaining of the previous progress
 
     def _plan_to(self, target, robot_latlon, skip_confirmation, found_in=''):
         """Start planning to target. Online results never skip the read-back."""
         online = target.source != 'curated'
+        self._target = target
         self._dest_name = target.name
         self._dest_note = '' if online else target.note
         self._found_in = found_in
@@ -645,6 +728,48 @@ class Mission:
         self._set_message(f'Planning a route to {target.name}.')
         return (CallPlanner(self._plan_id, robot_latlon[0], robot_latlon[1],
                             target.lat, target.lon),)
+
+    def _check_localization(self):
+        """Pause when the position is lost (never on a crossing); note when it is back."""
+        if self._quality is Quality.LOST:
+            if self._lost_hold or self._on_crossing:
+                return ()   # already holding, or finish the crossing first
+            self._lost_hold = True
+            self._failure_pause = False
+            if self._paused or self._pause_pending:
+                return ()
+            self._pause_pending = True
+            self._pause_text = ''
+            return (Pause(),)
+        self._lost_hold = False   # position back: stay paused until the user's go
+        return ()
+
+    def _can_reroute(self):
+        """Return True if leaving the route should trigger a new route now."""
+        return (self.state is MissionState.NAVIGATING and not self._on_crossing
+                and not self._pause_pending and self._quality is Quality.GOOD)
+
+    def _reroute(self, robot_latlon):
+        """Stop, clear the route and plan a new one from where the robot is."""
+        if robot_latlon is None:
+            return self._fail(MissionError.NAVIGATION_FAILED,
+                              "We've left the route and I don't know where we are. "
+                              'The robot has stopped.')
+        if self._reroutes >= self._config.max_reroutes:
+            return self._fail(MissionError.NAVIGATION_FAILED,
+                              'I keep losing the route. The robot has stopped.')
+        self._reroutes += 1
+        self._reroute_travel = self._travelled
+        self._plan_id += 1
+        self._phase = _Phase.REROUTING
+        self._active_route_id = 0
+        self._waiting = False
+        self._on_crossing = False
+        self._set_message("We've left the route. Stopping to find a new one.")
+        target = self._target
+        return (StopRobot(), ClearRoute(),
+                CallPlanner(self._plan_id, robot_latlon[0], robot_latlon[1],
+                            target.lat, target.lon))
 
     def _send_route(self):
         self._route_id += 1
@@ -675,7 +800,9 @@ class Mission:
         if state is self._last_state:
             return ()
         old, self._last_state = self._last_state, state
-        if state is MissionState.WAITING_AT_CROSSING:
+        if state is MissionState.POSITION_LOST:
+            self._set_message("I'm not sure where we are. Stopped, waiting for GPS.")
+        elif state is MissionState.WAITING_AT_CROSSING:
             n = len(self._plan.crossings) if self._plan else 0
             k = self._next_crossing
             what = ''
@@ -684,7 +811,9 @@ class Mission:
             self._set_message(f'At crossing {k + 1} of {n}{what}. '
                               'Press go when it is safe to cross.')
         elif state is MissionState.PAUSED:
-            if self._pause_text:            # the user's pause, now confirmed
+            if old is MissionState.POSITION_LOST:   # position back, still stopped
+                self._set_message('Position found again. Press go to continue.')
+            elif self._pause_text:          # the user's pause, now confirmed
                 self._set_message(self._pause_text)
                 self._pause_text = ''
             elif self._failure_pause:       # message already set by on_nav_status
@@ -695,6 +824,10 @@ class Mission:
             self._set_message('Crossing now.')
         elif old is MissionState.PAUSED:
             self._set_message('Continuing.')
+        elif state is MissionState.GPS_DEGRADED:
+            self._set_message('GPS signal is weak. Continuing carefully.')
+        elif old is MissionState.GPS_DEGRADED:
+            self._set_message('GPS signal is back.')
         else:
             self._version += 1
         return ()

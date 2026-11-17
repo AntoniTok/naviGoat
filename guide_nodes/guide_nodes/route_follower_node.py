@@ -9,28 +9,38 @@ the goal sender (guide/next_goal). The robot stops before every crossing
 until the user's go arrives on the guide/confirm_crossing service. All
 geometry is done in guide_core.route_follower; this node only converts
 messages.
+
+Frames (Step 8): the route, guide/pose, progress and goals are all in the
+route frame (route_frame, default 'enu': metres east / north of the configured
+origin). The goal sender converts goals into Nav2's map frame. Route files
+saved before Step 8 say 'map', which then meant the same enu coordinates, so
+they are read with route_file_frame (default 'map').
+
+Uncertainty (Step 8): each guide/pose carries the localizer's covariance; its
+sigma moves the next crossing's stop earlier and widens the arrival tolerance
+(see guide_core.route_follower). Off-route detection uses the poses' stamps as
+its clock and is reported in guide/route_progress (off_route).
 """
 
 import math
 
-import rclpy
-import yaml
 from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped
-from nav_msgs.msg import Path
-from rclpy.executors import ExternalShutdownException
-from rclpy.logging import get_logger
-from rclpy.node import Node
-from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
-from std_srvs.srv import Trigger
-
 from guide_core.angles import yaw_to_quaternion
-from guide_core.crossings import RouteCrossing as CoreCrossing
 from guide_core.crossings import crossings_from_dict
+from guide_core.crossings import RouteCrossing as CoreCrossing
 from guide_core.route import InvalidRouteError, Route, route_from_dict
 from guide_core.route_follower import FollowerConfig, Goal, RouteFollower
 from guide_core.walk_costs import CrossingType
 from guide_interfaces.msg import NavGoalStatus, RouteCrossing, RouteProgress
 from guide_interfaces.srv import SetRoute
+from nav_msgs.msg import Path
+import rclpy
+from rclpy.executors import ExternalShutdownException
+from rclpy.logging import get_logger
+from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+from std_srvs.srv import Trigger
+import yaml
 
 # "Latched" QoS for topics that describe current state and change rarely.
 # RELIABLE: messages are re-sent until received (no silent drops).
@@ -82,7 +92,11 @@ class RouteFollowerNode(Node):
         # come from FollowerConfig so they are defined in one place.
         defaults = FollowerConfig()
         self.declare_parameter('route_file', '')   # optional since Step 7
-        self.declare_parameter('map_frame', 'map')
+        # route_frame: the frame of routes, poses, progress and goals (Step 8: enu).
+        # route_file_frame: the frame written in route files (pre-Step-8 files say
+        # 'map', which then meant these same enu coordinates).
+        self.declare_parameter('route_frame', 'enu')
+        self.declare_parameter('route_file_frame', 'map')
         self.declare_parameter('lookahead', defaults.lookahead)
         self.declare_parameter('corner_angle_deg', 30.0)  # degrees, for humans
         self.declare_parameter('corner_release_distance', defaults.corner_release_distance)
@@ -92,8 +106,16 @@ class RouteFollowerNode(Node):
         self.declare_parameter('window_ahead', defaults.window_ahead)
         self.declare_parameter('crossing_stop_margin', defaults.crossing_stop_margin)
         self.declare_parameter('crossing_wait_distance', defaults.crossing_wait_distance)
+        # Step 8: uncertainty-aware stops / arrival and off-route detection. The
+        # meaning of each value is documented in guide_core FollowerConfig.
+        noise_fields = ('stop_sigma_factor', 'stop_sigma_included', 'stop_sigma_step',
+                        'stop_latch_distance', 'arrival_sigma_factor', 'off_route_distance',
+                        'back_on_route_distance', 'off_route_time', 'off_route_max_sigma')
+        for name in noise_fields:
+            self.declare_parameter(name, getattr(defaults, name))
 
-        self._map_frame = self.get_parameter('map_frame').value
+        self._route_frame = self.get_parameter('route_frame').value
+        self._route_file_frame = self.get_parameter('route_file_frame').value
         route_file = self.get_parameter('route_file').value
 
         # Follower settings: the same for every route this node follows.
@@ -108,6 +130,7 @@ class RouteFollowerNode(Node):
                 window_ahead=self.get_parameter('window_ahead').value,
                 crossing_stop_margin=self.get_parameter('crossing_stop_margin').value,
                 crossing_wait_distance=self.get_parameter('crossing_wait_distance').value,
+                **{name: self.get_parameter(name).value for name in noise_fields},
             )
         except ValueError as e:
             raise RouteLoadError(f'invalid follower parameter: {e}') from e
@@ -182,6 +205,9 @@ class RouteFollowerNode(Node):
         # Robot's s from the latest pose, for log messages and service replies.
         # None until the first pose has been processed on this route.
         self._last_robot_s = None
+        # Last logged stop shift (m) and off-route state, to log only changes.
+        self._logged_offset = 0.0
+        self._logged_off_route = False
 
     def _install(self, follower, route_id: int, source: str) -> None:
         """Make `follower` the current route, publish it and log its crossings."""
@@ -212,7 +238,7 @@ class RouteFollowerNode(Node):
         try:
             with open(route_file) as f:
                 data = yaml.safe_load(f)
-            route = route_from_dict(data, expected_frame=self._map_frame)
+            route = route_from_dict(data, expected_frame=self._route_file_frame)
             return route, crossings_from_dict(data, route)
         except OSError as e:
             raise RouteLoadError(f'cannot read route file {route_file!r}: {e}') from e
@@ -239,7 +265,7 @@ class RouteFollowerNode(Node):
         # A Path is a header plus a list of PoseStamped. Each waypoint's
         # orientation is the direction of the segment leaving it.
         path = Path()
-        path.header.frame_id = self._map_frame
+        path.header.frame_id = self._route_frame
         path.header.stamp = self.get_clock().now().to_msg()
         if self._follower is not None:
             route = self._follower.route
@@ -265,8 +291,8 @@ class RouteFollowerNode(Node):
             if request.route_id == 0:
                 raise ValueError('route_id must be > 0 (0 means "loaded from route_file")')
             frame = request.path.header.frame_id
-            if frame != self._map_frame:
-                raise ValueError(f"path is in frame '{frame}', expected '{self._map_frame}'")
+            if frame != self._route_frame:
+                raise ValueError(f"path is in frame '{frame}', expected '{self._route_frame}'")
             # The path's points are used exactly as sent (no rounding), so the
             # crossings' s values, measured by the planner along the same
             # points, line up (checked in Step 7.3).
@@ -322,20 +348,25 @@ class RouteFollowerNode(Node):
         if self._follower is None:
             return  # no route: nothing to follow, no progress to report
 
-        # Only map-frame poses can be compared with the route; anything else
-        # is a configuration error, reported at most every 5 s.
-        if msg.header.frame_id != self._map_frame:
+        # Only poses in the route frame can be compared with the route; anything
+        # else is a configuration error, reported at most every 5 s.
+        if msg.header.frame_id != self._route_frame:
             self.get_logger().warning(
                 f"ignoring pose in frame '{msg.header.frame_id}', "
-                f"expected '{self._map_frame}'",
+                f"expected '{self._route_frame}'",
                 throttle_duration_sec=5.0)
             return
 
         # PoseWithCovarianceStamped nests as msg.pose (with covariance)
-        # .pose (the Pose) .position; only x and y are used.
+        # .pose (the Pose) .position; only x and y are used. The covariance is 36
+        # numbers (6x6, row by row, over x y z roll pitch yaw): [0] is var(x) and
+        # [7] is var(y). The larger one, square-rooted, is the position sigma.
         position = msg.pose.pose.position
+        cov = msg.pose.covariance
+        sigma = math.sqrt(max(cov[0], cov[7], 0.0))
+        now = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
         try:
-            out = self._follower.update(position.x, position.y)
+            out = self._follower.update(position.x, position.y, sigma=sigma, now=now)
         except ValueError as e:
             self.get_logger().warning(f'ignoring pose: {e}', throttle_duration_sec=5.0)
             return
@@ -346,7 +377,7 @@ class RouteFollowerNode(Node):
         # output can be traced back to the measurement it came from.
         progress = RouteProgress()
         progress.header.stamp = msg.header.stamp
-        progress.header.frame_id = self._map_frame
+        progress.header.frame_id = self._route_frame
         progress.route_id = self._route_id
         progress.segment_index = out.segment_index
         progress.distance_along = out.s
@@ -358,7 +389,25 @@ class RouteFollowerNode(Node):
         progress.on_crossing = out.on_crossing
         progress.next_crossing_index = out.next_crossing_index
         progress.distance_to_next_crossing = out.distance_to_next_crossing
+        progress.off_route = out.off_route
         self._progress_pub.publish(progress)
+
+        # Log changes of the stop shift and of the off-route state (not every pose).
+        offset = self._follower.stop_offset
+        if offset != self._logged_offset and out.next_crossing_index >= 0:
+            self.get_logger().info(
+                f'Stop before {self._crossing_name(out.next_crossing_index)} moved '
+                f'{offset:.1f} m earlier (position uncertainty {sigma:.1f} m): '
+                f'now at s={self._follower.active_stop_s:.1f} m')
+        self._logged_offset = offset
+        if out.off_route != self._logged_off_route:
+            self._logged_off_route = out.off_route
+            if out.off_route:
+                self.get_logger().warning(
+                    f'Off the route: {abs(out.cross_track_error):.1f} m from it '
+                    f'(robot at s={out.s:.1f} m)')
+            else:
+                self.get_logger().info(f'Back on the route (robot at s={out.s:.1f} m)')
 
         if out.new_goal is not None:
             self._publish_goal(out.new_goal, msg.header.stamp, out.s)
@@ -380,7 +429,7 @@ class RouteFollowerNode(Node):
         """Publish a new goal for the goal sender (latched)."""
         msg = PoseStamped()
         msg.header.stamp = stamp
-        msg.header.frame_id = self._map_frame
+        msg.header.frame_id = self._route_frame
         msg.pose.position.x = goal.x
         msg.pose.position.y = goal.y
         set_yaw(msg.pose, goal.yaw)
@@ -419,10 +468,10 @@ class RouteFollowerNode(Node):
             return
 
         goal = msg.goal
-        if goal.header.frame_id != self._map_frame:
+        if goal.header.frame_id != self._route_frame:
             self.get_logger().warning(
                 f"ignoring goal status in frame '{goal.header.frame_id}', "
-                f"expected '{self._map_frame}'",
+                f"expected '{self._route_frame}'",
                 throttle_duration_sec=5.0)
             return
 

@@ -12,10 +12,23 @@ guidance is lost. guide/paused reports the current state.
 guide/cancel ends everything (used by the mission manager when a mission
 stops early): the active goal is cancelled, the latest goal is forgotten (so
 nothing can be resumed) and pause is cleared.
+
+Frames (Step 8): the route follower's goals are in the enu frame (metres east /
+north of the configured origin), but Nav2 needs goals in its map frame
+(RTAB-Map's). This node is the boundary: an enu goal is converted into the map
+frame with the localizer's latest guide/map_in_enu at the moment it is sent
+(also when re-sent on resume). Until the first guide/map_in_enu arrives, enu
+goals wait. Goals already in the map frame are sent unchanged.
 """
 
 import math
 
+from action_msgs.msg import GoalStatus
+from geometry_msgs.msg import PoseStamped, TransformStamped
+from guide_core.angles import quaternion_to_yaw, yaw_to_quaternion
+from guide_core.se2 import Pose2D, relative
+from guide_interfaces.msg import NavGoalStatus
+from nav2_msgs.action import NavigateToPose
 import rclpy
 from rclpy.action import ActionClient
 from rclpy.executors import ExternalShutdownException
@@ -23,15 +36,8 @@ from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from rclpy.signals import SignalHandlerOptions
 from rclpy.time import Time
-
-from action_msgs.msg import GoalStatus
-from geometry_msgs.msg import PoseStamped
-from nav2_msgs.action import NavigateToPose
 from std_msgs.msg import Bool
 from std_srvs.srv import Trigger
-
-from guide_core.angles import quaternion_to_yaw
-from guide_interfaces.msg import NavGoalStatus
 
 
 # Latched QoS for rarely-changing state topics (same profile as the route follower uses).
@@ -79,11 +85,19 @@ class GoalSenderNode(Node):
         self.declare_parameter('feedback_log_period', 5.0)
         self.declare_parameter('cancel_timeout', 1.0)
         self.declare_parameter('max_goal_age', 5.0)
+        # Frames (Step 8): goals in enu_frame are converted into nav_frame (the frame
+        # Nav2 plans in) before sending; goals already in nav_frame go unchanged.
+        self.declare_parameter('enu_frame', 'enu')
+        self.declare_parameter('nav_frame', 'map')
         self._action_name = self.get_parameter('action_name').value
         retry_period = float(self.get_parameter('retry_period').value)
         self._feedback_log_period = float(self.get_parameter('feedback_log_period').value)
         self._cancel_timeout = float(self.get_parameter('cancel_timeout').value)
         self._max_goal_age = float(self.get_parameter('max_goal_age').value)
+        self._enu_frame = self.get_parameter('enu_frame').value
+        self._nav_frame = self.get_parameter('nav_frame').value
+        # Latest "map frame expressed in enu" from the localizer (a Pose2D), or None.
+        self._map_in_enu = None
 
         # Goal bookkeeping.
         # _seq: number of the newest goal received (1, 2, 3...). Every callback remembers
@@ -138,6 +152,11 @@ class GoalSenderNode(Node):
         self._goal_sub = self.create_subscription(
             PoseStamped, 'guide/next_goal', self._on_next_goal, LATCHED_QOS)
 
+        # The localizer's estimate of where the map frame sits in enu (10 Hz, default
+        # reliable QoS). Only the latest value is kept; it is used at send time.
+        self.create_subscription(
+            TransformStamped, 'guide/map_in_enu', self._on_map_in_enu, 10)
+
         # Timer: retries sending a goal that is waiting for the action server. It also
         # wakes the executor at least once per retry_period, which lets Ctrl+C get
         # through quickly (see main()).
@@ -188,7 +207,42 @@ class GoalSenderNode(Node):
         self._publish_status(NavGoalStatus.PENDING)
         self._try_send()
 
+    # Remember the newest map-frame position from the localizer.
+    def _on_map_in_enu(self, msg):
+        t = msg.transform
+        q = t.rotation
+        self._map_in_enu = Pose2D(t.translation.x, t.translation.y,
+                                  quaternion_to_yaw(q.x, q.y, q.z, q.w))
+
     # ---- Sending -------------------------------------------------------------------
+
+    # Returns the newest goal as a Pose in nav_frame, or None if it cannot be
+    # converted yet (an enu goal before the localizer's first guide/map_in_enu).
+    # relative(T, goal) expresses the enu goal in the map frame: the inverse of
+    # "map frame in enu" applied to the goal's position and heading.
+    def _goal_in_nav_frame(self):
+        frame = self._goal.header.frame_id
+        if frame != self._enu_frame:
+            if frame != self._nav_frame:
+                self.get_logger().warn(
+                    f"Goal #{self._seq} is in frame '{frame}', sending it unchanged",
+                    throttle_duration_sec=5.0)
+            return self._goal.pose
+        if self._map_in_enu is None:
+            self.get_logger().warn(
+                f'Goal #{self._seq} waiting: no guide/map_in_enu from the localizer yet',
+                throttle_duration_sec=5.0)
+            return None
+        p = self._goal.pose.position
+        q = self._goal.pose.orientation
+        converted = relative(self._map_in_enu,
+                             Pose2D(p.x, p.y, quaternion_to_yaw(q.x, q.y, q.z, q.w)))
+        pose = PoseStamped().pose
+        pose.position.x = converted.x
+        pose.position.y = converted.y
+        pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w = \
+            yaw_to_quaternion(converted.yaw)
+        return pose
 
     # Sends the newest goal if it is unsent and the action server is available.
     # Called right after a goal arrives and again by the timer, so a goal received
@@ -203,15 +257,20 @@ class GoalSenderNode(Node):
                 'not available', throttle_duration_sec=5.0)
             return
 
+        pose = self._goal_in_nav_frame()
+        if pose is None:
+            return  # retried by the timer once the alignment is known
+
         self._unsent = False
         seq = self._seq
 
-        # Build the NavigateToPose goal. Same frame and pose as received, but the stamp
-        # is left at zero, meaning "use the latest available transform" (decision 6).
+        # Build the NavigateToPose goal, in Nav2's frame. The stamp is left at zero,
+        # meaning "use the latest available transform" (decision 6).
         # behavior_tree = '' tells Nav2 to use its default behaviour tree.
         goal = NavigateToPose.Goal()
-        goal.pose.header.frame_id = self._goal.header.frame_id
-        goal.pose.pose = self._goal.pose
+        converted = self._goal.header.frame_id == self._enu_frame
+        goal.pose.header.frame_id = self._nav_frame if converted else self._goal.header.frame_id
+        goal.pose.pose = pose
         goal.behavior_tree = ''
 
         # send_goal_async() returns immediately with a future (a placeholder for a reply
@@ -222,7 +281,9 @@ class GoalSenderNode(Node):
             goal, feedback_callback=lambda fb, seq=seq: self._on_feedback(seq, fb))
         send_future.add_done_callback(
             lambda future, seq=seq: self._on_goal_response(seq, future))
-        self.get_logger().info(f"Goal #{seq} sent to '{self._action_name}'")
+        where = (f' as x={pose.position.x:.2f} y={pose.position.y:.2f} ({self._nav_frame})'
+                 if converted else '')
+        self.get_logger().info(f"Goal #{seq} sent to '{self._action_name}'{where}")
 
     # ---- Action callbacks ----------------------------------------------------------
 

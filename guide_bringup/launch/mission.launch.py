@@ -3,17 +3,20 @@
 Starts: sim robot, localizer, route follower (no route; routes come from the
 mission manager), goal sender, route planner (cached OSM graph), geocoder
 (names not in the curated list: Nominatim online + on-disk cache) and mission
-manager (curated destinations).
+manager (curated destinations); optionally RViz and the run evaluator.
 
 Usage:
   ros2 launch guide_bringup mission.launch.py
   ros2 launch guide_bringup mission.launch.py rviz:=true
   ros2 launch guide_bringup mission.launch.py start_x:=... start_y:=... start_yaw_deg:=...
   ros2 launch guide_bringup mission.launch.py online_lookup:=false   # never go online
+  # Step 8: realistic sensors, repeatable with a seed, scored against ground truth:
+  ros2 launch guide_bringup mission.launch.py sensors:=urban_canyon noise_seed:=2
+      evaluate:=true auto_go:=true            (all on one line)
 
 Then, in another terminal:
-  ros2 action send_goal --feedback /guide/navigate_to guide_interfaces/action/NavigateTo \
-      "{destination: 'south ken'}"
+  ros2 action send_goal --feedback /guide/navigate_to
+      guide_interfaces/action/NavigateTo "{destination: 'south ken'}"   (one line)
   ros2 service call /guide/user_go std_srvs/srv/Trigger      # the user's go
   ros2 service call /guide/user_pause std_srvs/srv/Trigger   # the user's pause
 
@@ -21,12 +24,67 @@ Ctrl+C stops all nodes (the goal sender cancels any active goal first).
 """
 
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument
+from launch.actions import DeclareLaunchArgument, OpaqueFunction
 from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 from launch_ros.substitutions import FindPackageShare
+
+# Sensor presets for the simulator (Step 8). Each maps to sim_robot parameters;
+# 'gps_zones' names a file in share/guide_bringup/sim/ (None = the same GPS
+# everywhere, given by gps_profile). Every preset reports the receiver's sigma
+# (report_gps_covariance), so the localizer knows how good the GPS claims to be.
+SENSOR_PRESETS = {
+    # Regression: everything exact, map frame = enu (the M3 conditions).
+    'perfect': {'gps_profile': 'perfect', 'gps_zones': None, 'odom_profile': 'perfect',
+                'slam_profile': 'enu', 'imu_yaw_bias_deg': 0.0, 'imu_yaw_noise_deg': 0.0},
+    # Frames only: exact sensors, but the map frame starts at the robot (as RTAB-Map's).
+    'map_offset': {'gps_profile': 'perfect', 'gps_zones': None, 'odom_profile': 'perfect',
+                   'slam_profile': 'perfect', 'imu_yaw_bias_deg': 0.0,
+                   'imu_yaw_noise_deg': 0.0},
+    # Noisy: open-sky GPS, no fix in tunnels, drifting odometry and SLAM, biased compass.
+    'open': {'gps_profile': 'open', 'gps_zones': 'gps_open.yaml',
+             'odom_profile': 'skid_steer', 'slam_profile': 'lidar',
+             'imu_yaw_bias_deg': 5.0, 'imu_yaw_noise_deg': 2.0},
+    # M4: as 'open', with urban-canyon GPS (bias, jitter, multipath jumps, dropouts).
+    'urban_canyon': {'gps_profile': 'urban_canyon', 'gps_zones': 'gps_urban_canyon.yaml',
+                     'odom_profile': 'skid_steer', 'slam_profile': 'lidar',
+                     'imu_yaw_bias_deg': 5.0, 'imu_yaw_noise_deg': 2.0},
+}
+
+
+def make_sim(context, share, origin, as_float):
+    """Build the sim_robot node for the chosen sensors preset.
+
+    OpaqueFunction calls this at launch time with the launch context, so
+    .perform(context) turns a launch argument into its actual text: the preset
+    has to be looked up in SENSOR_PRESETS (plain Python) before the node exists.
+    """
+    name = LaunchConfiguration('sensors').perform(context)
+    if name not in SENSOR_PRESETS:
+        raise RuntimeError(f"Unknown sensors preset '{name}'; "
+                           f'choose one of: {", ".join(SENSOR_PRESETS)}')
+    preset = SENSOR_PRESETS[name]
+    zones = (PathJoinSubstitution([share, 'sim', preset['gps_zones']])
+             if preset['gps_zones'] else 'none')
+    return [Node(
+        package='guide_sim', executable='sim_robot', output='screen',
+        parameters=[{
+            'start_x': as_float('start_x'),
+            'start_y': as_float('start_y'),
+            'start_yaw_deg': as_float('start_yaw_deg'),
+            **origin,
+            'noise_seed': ParameterValue(LaunchConfiguration('noise_seed'), value_type=int),
+            'gps_profile': preset['gps_profile'],
+            'gps_zones_file': zones,
+            'graph_file': LaunchConfiguration('graph_file'),   # tunnels for the zones
+            'report_gps_covariance': True,
+            'odom_profile': preset['odom_profile'],
+            'slam_profile': preset['slam_profile'],
+            'imu_yaw_bias_deg': preset['imu_yaw_bias_deg'],
+            'imu_yaw_noise_deg': preset['imu_yaw_noise_deg'],
+        }])]
 
 
 def generate_launch_description():
@@ -46,12 +104,12 @@ def generate_launch_description():
                               description='Sim robot start, metres north of the origin'),
         DeclareLaunchArgument('start_yaw_deg', default_value='-82.0',
                               description='Sim robot start heading, degrees (0 = east)'),
-        # The ENU origin of the map frame. Given ONCE here and passed to every node
-        # that converts between lat/lon and metres, so they cannot disagree.
+        # The ENU origin. Given ONCE here and passed to every node that converts
+        # between lat/lon and metres, so they cannot disagree.
         DeclareLaunchArgument('origin_lat', default_value='51.4988',
-                              description='Latitude of the map frame origin (degrees)'),
+                              description='Latitude of the enu frame origin (degrees)'),
         DeclareLaunchArgument('origin_lon', default_value='-0.1749',
-                              description='Longitude of the map frame origin (degrees)'),
+                              description='Longitude of the enu frame origin (degrees)'),
         DeclareLaunchArgument(
             'graph_file',
             default_value=PathJoinSubstitution([share, 'osm', 'south_ken_walk.graphml']),
@@ -70,6 +128,15 @@ def generate_launch_description():
             description='Saved online answers (kept outside the workspace; survives updates)'),
         DeclareLaunchArgument('rviz', default_value='false',
                               description="'true' also starts RViz"),
+        # Step 8: simulated sensors (see SENSOR_PRESETS) and the run evaluator.
+        DeclareLaunchArgument('sensors', default_value='perfect',
+                              description='Sim sensors: ' + ' | '.join(SENSOR_PRESETS)),
+        DeclareLaunchArgument('noise_seed', default_value='0',
+                              description='Seed of all simulated noise (same seed = same run)'),
+        DeclareLaunchArgument('evaluate', default_value='false',
+                              description="'true' starts run_evaluator (scores vs ground truth)"),
+        DeclareLaunchArgument('auto_go', default_value='false',
+                              description="'true': run_evaluator presses go (test runs only)"),
     ]
 
     # Launch arguments are text. ParameterValue(..., value_type=float) makes sure
@@ -84,14 +151,8 @@ def generate_launch_description():
     # output='screen' shows its log lines in this terminal, prefixed with the
     # process name, e.g. [mission_manager-6]. parameters=[{...}] is the launch-file
     # equivalent of --ros-args -p name:=value.
-    sim = Node(
-        package='guide_sim', executable='sim_robot', output='screen',
-        parameters=[{
-            'start_x': as_float('start_x'),
-            'start_y': as_float('start_y'),
-            'start_yaw_deg': as_float('start_yaw_deg'),
-            **origin,
-        }])
+    # The simulator depends on the sensors preset, so it is built at launch time.
+    sim = OpaqueFunction(function=make_sim, args=[share, origin, as_float])
     localizer = Node(package='guide_nodes', executable='localizer', output='screen',
                      parameters=[origin])
     # No route_file: the follower waits for routes on guide/set_route.
@@ -124,6 +185,14 @@ def generate_launch_description():
         arguments=['-d', PathJoinSubstitution([share, 'rviz', 'route_planner.rviz'])],
         condition=IfCondition(LaunchConfiguration('rviz')))
 
+    # Optional run evaluator (dev tool in guide_sim): compares the stack with the
+    # simulator's ground truth and prints a summary when the trip ends.
+    evaluator = Node(
+        package='guide_sim', executable='run_evaluator', output='screen',
+        parameters=[{'auto_go': ParameterValue(LaunchConfiguration('auto_go'),
+                                               value_type=bool)}],
+        condition=IfCondition(LaunchConfiguration('evaluate')))
+
     return LaunchDescription([
         *args,
         sim,
@@ -134,4 +203,5 @@ def generate_launch_description():
         geocoder,
         mission_manager,
         rviz,
+        evaluator,
     ])

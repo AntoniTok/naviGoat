@@ -18,25 +18,19 @@ Names not in the curated list are looked up with the geocoder node
 Nothing here ever blocks: every service call is asynchronous and its answer
 arrives later as one more event (a blocking call inside a callback would
 deadlock this single-threaded node).
+
+Step 8: guide/pose is in the enu frame (metres east / north of the origin),
+so it converts straight to lat/lon. guide/localization_status (GOOD /
+DEGRADED / LOST) and guide/route_progress's off_route flag go to Mission, which
+reports GPS_DEGRADED / POSITION_LOST and plans a new route when needed.
 """
 
 import os
 import time
 
-import rclpy
-import yaml
 from geometry_msgs.msg import PoseWithCovarianceStamped
-from rclpy.action import ActionServer, CancelResponse, GoalResponse
-from rclpy.callback_groups import ReentrantCallbackGroup
-from rclpy.executors import ExternalShutdownException
-from rclpy.node import Node
-from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
-from rclpy.task import Future
-from std_msgs.msg import Bool
-from std_srvs.srv import Trigger
-
 from guide_core.destinations import (
-    Destination, DestinationError, MatchConfig, MatchType, Outcome, destinations_from_dict,
+    Destination, DestinationError, destinations_from_dict, MatchConfig, MatchType, Outcome,
     resolve,
 )
 from guide_core.geo import enu_to_latlon
@@ -49,9 +43,20 @@ from guide_core.mission import (
 from guide_core.online_resolve import resolve_online
 from guide_interfaces.action import NavigateTo
 from guide_interfaces.msg import (
-    DestinationCandidate, MissionState, NavGoalStatus, RouteCrossing, RouteProgress,
+    DestinationCandidate, LocalizationStatus, MissionState, NavGoalStatus, RouteCrossing,
+    RouteProgress,
 )
 from guide_interfaces.srv import Geocode, PlanRoute, ResolveDestination, SetRoute
+import rclpy
+from rclpy.action import ActionServer, CancelResponse, GoalResponse
+from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.executors import ExternalShutdownException
+from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+from rclpy.task import Future
+from std_msgs.msg import Bool
+from std_srvs.srv import Trigger
+import yaml
 
 # Latched QoS, as in the other nodes: RELIABLE + TRANSIENT_LOCAL, depth 1.
 # Needed to receive guide/paused and guide/goal_status, which are latched.
@@ -83,7 +88,8 @@ STATE_NAMES = {
     MissionState.READY: 'READY', MissionState.NAVIGATING: 'NAVIGATING',
     MissionState.WAITING_AT_CROSSING: 'WAITING_AT_CROSSING',
     MissionState.PAUSED: 'PAUSED', MissionState.ARRIVED: 'ARRIVED',
-    MissionState.FAILED: 'FAILED',
+    MissionState.FAILED: 'FAILED', MissionState.GPS_DEGRADED: 'GPS_DEGRADED',
+    MissionState.POSITION_LOST: 'POSITION_LOST', MissionState.REROUTING: 'REROUTING',
 }
 
 
@@ -92,7 +98,7 @@ class StartupError(Exception):
 
 
 def stamp_to_sec(stamp):
-    """builtin_interfaces/Time -> float seconds."""
+    """Convert a builtin_interfaces/Time to float seconds."""
     return stamp.sec + stamp.nanosec * 1e-9
 
 
@@ -188,6 +194,9 @@ class MissionManagerNode(Node):
         self.create_subscription(Bool, 'guide/paused', self._on_paused, LATCHED_QOS)
         self.create_subscription(NavGoalStatus, 'guide/goal_status', self._on_goal_status,
                                  LATCHED_QOS)
+        # The localizer's quality, 2 Hz with default reliable QoS (not latched).
+        self.create_subscription(LocalizationStatus, 'guide/localization_status',
+                                 self._on_localization, 10)
 
         # --- Action server ---
         # An action = goal + stream of feedback + final result, and the client
@@ -251,12 +260,15 @@ class MissionManagerNode(Node):
     # ---- Action server callbacks ----------------------------------------------------
 
     def _on_goal_request(self, goal_request):
-        """Accept every goal; a goal that cannot run now is ended with BUSY in
-        _execute, so the client gets a result with a spoken message."""
+        """Accept every goal.
+
+        A goal that cannot run now is ended with BUSY in _execute, so the
+        client gets a result with a spoken message.
+        """
         return GoalResponse.ACCEPT
 
     def _on_cancel_request(self, goal_handle):
-        """The client cancelled the goal (e.g. Ctrl+C on ros2 action send_goal).
+        """Handle the client cancelling the goal (e.g. Ctrl+C on ros2 action send_goal).
 
         Mission.cancel() returns StopRobot / ClearRoute / Finish(CANCELED);
         the Finish completes the Future that _execute is waiting on.
@@ -335,10 +347,10 @@ class MissionManagerNode(Node):
         self._pose = (p.x, p.y, time.monotonic())
 
     def _robot_latlon(self):
-        """(lat, lon) of the robot, or None if no pose in the last max_pose_age s.
+        """Return the robot's (lat, lon), or None if no pose in the last max_pose_age s.
 
-        v0: the map frame IS the ENU frame around the origin (true in sim);
-        real map/GPS alignment comes in Step 8.
+        guide/pose is in the enu frame around the origin (localizer v1 aligns
+        GPS with the SLAM map), so it converts straight to lat/lon.
         """
         if self._pose is None:
             return None
@@ -348,19 +360,34 @@ class MissionManagerNode(Node):
         return enu_to_latlon(x, y, *self._origin)
 
     def _on_progress(self, msg):
-        """guide/route_progress -> Mission (it ignores other routes' progress)."""
+        """Pass guide/route_progress to Mission (it ignores other routes' progress).
+
+        The robot's position goes along: Mission needs it to plan a new route
+        when off_route says the robot has left this one.
+        """
         if msg.route_id == self._mission.route_id and msg.route_id != 0:
             self._progress = msg
         self._run(self._mission.on_progress(Progress(
             route_id=msg.route_id, distance_remaining=msg.distance_remaining,
             arrived=msg.arrived, waiting_at_crossing=msg.waiting_at_crossing,
-            on_crossing=msg.on_crossing, next_crossing_index=msg.next_crossing_index)))
+            on_crossing=msg.on_crossing, next_crossing_index=msg.next_crossing_index,
+            off_route=msg.off_route), robot_latlon=self._robot_latlon()))
+
+    def _on_localization(self, msg):
+        """Pass the localizer's quality (GOOD / DEGRADED / LOST) to Mission."""
+        try:
+            commands = self._mission.on_localization(msg.quality)
+        except ValueError:
+            self.get_logger().warning(f'Unknown localization quality {msg.quality}',
+                                      throttle_duration_sec=10.0)
+            return
+        self._run(commands)
 
     def _on_paused(self, msg):
         self._run(self._mission.on_paused(msg.data))
 
     def _on_goal_status(self, msg):
-        """guide/goal_status -> Mission (only ABORTED / REJECTED matter to it)."""
+        """Pass guide/goal_status to Mission (only ABORTED / REJECTED matter to it)."""
         try:
             status = NavStatus(msg.status)
         except ValueError:
@@ -400,7 +427,7 @@ class MissionManagerNode(Node):
         self._publish_state()
 
     def _call_planner(self, command):
-        """CallPlanner -> guide/plan_route; answer -> Mission.on_plan_result."""
+        """Call guide/plan_route for CallPlanner; the answer goes to Mission."""
         if not self._plan_client.service_is_ready():
             self._run(self._mission.on_plan_result(
                 command.plan_id, False, 'the route planner is not running'))
@@ -471,13 +498,13 @@ class MissionManagerNode(Node):
 
     @staticmethod
     def _destinations_from(response):
-        """Geocode response candidates -> Destinations (source 'nominatim')."""
+        """Convert Geocode response candidates into Destinations (source 'nominatim')."""
         return tuple(Destination(name=c.name, lat=c.latitude, lon=c.longitude, note=c.note,
                                  source=c.source or 'nominatim')
                      for c in response.candidates)
 
     def _look_up(self, command):
-        """LookUpOnline -> guide/geocode; answer -> Mission.on_lookup_result."""
+        """Call guide/geocode for LookUpOnline; the answer goes to Mission."""
         self.get_logger().info(f"Looking up #{command.lookup_id} '{command.query}'")
 
         def done(response, why):
@@ -496,7 +523,7 @@ class MissionManagerNode(Node):
         self._call_geocoder(command.query, done)
 
     def _send_route(self, command):
-        """SendRoute -> guide/set_route with the last plan; answer -> on_route_set."""
+        """Call guide/set_route with the last plan for SendRoute; the answer goes to Mission."""
         sent = stamp_to_sec(self.get_clock().now().to_msg())
         if not self._set_route_client.service_is_ready() or self._plan_response is None:
             self._run(self._mission.on_route_set(
@@ -543,7 +570,7 @@ class MissionManagerNode(Node):
     # ---- The user's inputs ----------------------------------------------------------
 
     def _on_user_go(self, request, response):
-        """guide/user_go: start / cross / resume, whatever "go" means right now."""
+        """Handle guide/user_go: start / cross / resume, whatever "go" means right now."""
         reply = self._mission.on_go(time.monotonic())
         self.get_logger().info(f"User go: {'accepted' if reply.accepted else 'ignored'}: "
                                f'{reply.text}')
@@ -552,7 +579,7 @@ class MissionManagerNode(Node):
         return response
 
     def _on_user_pause(self, request, response):
-        """guide/user_pause: stop where we are (always obeyed while moving)."""
+        """Handle guide/user_pause: stop where we are (always obeyed while moving)."""
         reply = self._mission.on_pause()
         self.get_logger().info(f"User pause: {'accepted' if reply.accepted else 'ignored'}: "
                                f'{reply.text}')
@@ -561,7 +588,7 @@ class MissionManagerNode(Node):
         return response
 
     async def _on_resolve_destination(self, request, response):
-        """guide/resolve_destination: look a name up, ranked, without starting a trip.
+        """Handle guide/resolve_destination: look a name up, ranked, without a trip.
 
         The same chain as a trip: the curated list, then (if nothing matched)
         the geocoder. "async def" + await: while waiting for the geocoder the
@@ -608,14 +635,16 @@ class MissionManagerNode(Node):
     # ---- Mission state and feedback -------------------------------------------------
 
     def _on_timer(self):
-        """Routine feedback (distance updates) every feedback_period."""
+        """Send routine feedback (distance updates) every feedback_period."""
         if (self._goal_handle is not None
                 and time.monotonic() - self._last_feedback >= self._feedback_period):
             self._publish_feedback(self._mission_state_msg())
 
     def _publish_state(self):
-        """If the mission's snapshot changed: publish guide/mission_state, send
-        feedback right away and log the new message."""
+        """Publish guide/mission_state if the mission's snapshot changed.
+
+        Also sends feedback right away and logs the new message.
+        """
         if self._mission.version == self._published_version:
             return
         self._published_version = self._mission.version
@@ -626,7 +655,7 @@ class MissionManagerNode(Node):
             self._publish_feedback(msg)
 
     def _publish_feedback(self, state_msg):
-        """NavigateTo feedback: the mission state plus our route's latest progress."""
+        """Publish NavigateTo feedback: the mission state and our route's progress."""
         self._last_feedback = time.monotonic()
         feedback = NavigateTo.Feedback()
         feedback.mission = state_msg
@@ -635,7 +664,7 @@ class MissionManagerNode(Node):
         self._goal_handle.publish_feedback(feedback)
 
     def _mission_state_msg(self):
-        """Mission snapshot -> guide_interfaces/MissionState."""
+        """Convert the mission snapshot into a guide_interfaces/MissionState."""
         snap = self._mission.snapshot()
         msg = MissionState()
         msg.header.stamp = self.get_clock().now().to_msg()

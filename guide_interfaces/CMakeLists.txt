@@ -17,6 +17,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/RouteCrossing.msg"
   "msg/MissionState.msg"
   "msg/DestinationCandidate.msg"
+  "msg/LocalizationStatus.msg"
   "srv/PlanRoute.srv"
   "srv/SetRoute.srv"
   "srv/ResolveDestination.srv"

@@ -1,8 +1,9 @@
 # Progress of the robot along the current route.
-# Published by route_follower on guide/route_progress, once per guide/pose (5 Hz).
-# All distances are in metres; positions are measured in the map frame.
+# Published by route_follower on guide/route_progress, once per guide/pose (10 Hz).
+# All distances are in metres; positions are measured in the route frame (enu
+# since Step 8: metres east / north of the configured origin).
 
-# stamp = stamp of the pose this was computed from; frame_id = "map"
+# stamp = stamp of the pose this was computed from; frame_id = the route frame ("enu")
 std_msgs/Header header
 
 # Which route this refers to: the route_id given to guide/set_route,
@@ -47,3 +48,10 @@ int32 next_crossing_index
 # That crossing's near kerb (start_s) minus the robot's distance_along.
 # Negative once the robot is past the near kerb; 0.0 if no crossings are left.
 float64 distance_to_next_crossing
+
+# --- Step 8 ---
+
+# True while the robot has been more than off_route_distance (10 m) from the
+# route for off_route_time (5 s), until it is back within back_on_route_distance
+# (5 m). Never judged on or at a crossing, or while the position is too uncertain.
+bool off_route

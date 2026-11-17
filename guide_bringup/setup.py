@@ -24,6 +24,7 @@ setup(
         (os.path.join('share', package_name, 'osm'),
             glob('osm/*.graphml') + glob('osm/*.meta.yaml')),
         (os.path.join('share', package_name, 'rviz'), glob('rviz/*.rviz')),
+        (os.path.join('share', package_name, 'sim'), glob('sim/*.yaml')),
     ],
     install_requires=['setuptools'],
     zip_safe=True,

@@ -26,6 +26,7 @@ setup(
         'console_scripts': [
             'sim_robot = guide_sim.sim_robot_node:main',
             'fake_nominatim = guide_sim.fake_nominatim:main',
+            'run_evaluator = guide_sim.run_evaluator:main',
         ],
     },
 )

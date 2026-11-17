@@ -7,13 +7,24 @@ held at sharp corners so the local planner never cuts across them, and at a
 stop point before every road crossing, where the robot waits for the user.
 Only the user releases a crossing (confirm_crossing); the goal is then held
 at the far kerb, so Nav2 crosses straight over, before normal goals resume.
+
+Under position uncertainty (Step 8), update() can also be given the robot's
+position sigma and the time:
+* the stop before the next crossing moves earlier by about 3 sigma, so an
+  uncertain position can never carry the robot onto the road unconfirmed;
+* the arrival tolerance grows a little with sigma;
+* off-route detection: off_route becomes True once the robot has been more
+  than off_route_distance from the route for off_route_time seconds, and False
+  again below back_on_route_distance (never judged on or at a crossing, or
+  while sigma is above off_route_max_sigma).
+Without sigma and time the follower behaves exactly as before Step 8.
 """
 
-import math
 from dataclasses import dataclass
+import math
 from typing import Optional
 
-from guide_core.crossings import RouteCrossing, prepare_crossings, stop_points
+from guide_core.crossings import prepare_crossings, RouteCrossing, stop_points
 from guide_core.route import Route
 
 #: Goals whose distance along the route differs by less than this (m) are the same goal.
@@ -46,6 +57,19 @@ class FollowerConfig:
             guide_core.crossings.stop_points). May be 0.
         crossing_wait_distance: The robot is waiting at a crossing once it is
             within this distance (along the route) of the stop point.
+        stop_sigma_factor, stop_sigma_included, stop_sigma_step: the stop point
+            moves earlier by stop_sigma_factor * (sigma - stop_sigma_included),
+            rounded up to a multiple of stop_sigma_step (none if negative).
+        stop_latch_distance: Within this distance before the (static) stop point
+            the shift only ever grows, so the stop goal cannot creep back and forth.
+        arrival_sigma_factor: The arrival tolerance is
+            max(arrival_tolerance, arrival_sigma_factor * sigma).
+        off_route_distance, back_on_route_distance: Cross-track error (m) above
+            which the robot counts as off the route (after off_route_time
+            seconds), and below which it is back on it.
+        off_route_time: Seconds the robot must stay beyond off_route_distance.
+        off_route_max_sigma: Above this sigma (m) off-route is not judged (the
+            state is kept as it was): the error is then more likely ours.
 
     Raises:
         ValueError: If a distance is not positive and finite (crossing_stop_margin:
@@ -61,6 +85,17 @@ class FollowerConfig:
     window_ahead: float = 30.0
     crossing_stop_margin: float = 1.5
     crossing_wait_distance: float = 1.5
+    # 3: the along-route error of an honest filter exceeds 3 sigma only ~0.1 %
+    # of the time (2 sigma: ~2 %, too often for "never"; Step 8 M4 runs).
+    stop_sigma_factor: float = 3.0
+    stop_sigma_included: float = 0.5
+    stop_sigma_step: float = 0.5
+    stop_latch_distance: float = 15.0
+    arrival_sigma_factor: float = 0.5
+    off_route_distance: float = 10.0
+    back_on_route_distance: float = 5.0
+    off_route_time: float = 5.0
+    off_route_max_sigma: float = 5.0
 
     def __post_init__(self):
         for name in ('lookahead', 'corner_release_distance', 'goal_update_distance',
@@ -74,6 +109,18 @@ class FollowerConfig:
                              f'got {self.crossing_stop_margin}')
         if not 0.0 <= self.corner_angle <= math.pi:  # also rejects NaN
             raise ValueError(f'corner_angle must be in [0, pi], got {self.corner_angle}')
+        for name in ('stop_sigma_step', 'off_route_distance', 'back_on_route_distance',
+                     'off_route_max_sigma'):
+            value = getattr(self, name)
+            if not (math.isfinite(value) and value > 0.0):
+                raise ValueError(f'{name} must be a positive finite number, got {value}')
+        for name in ('stop_sigma_factor', 'stop_sigma_included', 'stop_latch_distance',
+                     'arrival_sigma_factor', 'off_route_time'):
+            value = getattr(self, name)
+            if not (math.isfinite(value) and value >= 0.0):
+                raise ValueError(f'{name} must be finite and >= 0, got {value}')
+        if not self.back_on_route_distance < self.off_route_distance:
+            raise ValueError('back_on_route_distance must be < off_route_distance')
 
 
 @dataclass(frozen=True)
@@ -126,6 +173,8 @@ class FollowerOutput:
             crossing not yet confirmed, or -1 if none are left.
         distance_to_next_crossing: That crossing's start_s (near kerb) minus the
             robot's s (m); negative once past the near kerb; 0.0 if none left.
+        off_route: True while the robot counts as off the route (see the module
+            docstring); always False when update() is not given the time.
     """
 
     s: float
@@ -139,6 +188,7 @@ class FollowerOutput:
     on_crossing: bool = False
     next_crossing_index: int = -1
     distance_to_next_crossing: float = 0.0
+    off_route: bool = False
 
 
 class RouteFollower:
@@ -174,30 +224,38 @@ class RouteFollower:
         self._next_crossing = 0                # index of the first crossing not yet released
         self._stop_reached = False             # Nav2 reported the current stop goal reached
         self._exit_s: Optional[float] = None   # far kerb of a confirmed crossing, until released
+        # Uncertainty handling (Step 8) for the next crossing's stop:
+        # _stop_offset: how far (m) the stop has been moved earlier;
+        # _stop_floor: s where the robot already was when a larger offset put the
+        #   stop behind it (it then stops there instead of being sent back).
+        self._stop_offset = 0.0
+        self._stop_floor: Optional[float] = None
+        self._off_route = False
+        self._off_since: Optional[float] = None   # time the error first exceeded the limit
 
     @property
     def route(self) -> Route:
-        """The route being followed."""
+        """Return the route being followed."""
         return self._route
 
     @property
     def config(self) -> FollowerConfig:
-        """The tuning values in use."""
+        """Return the tuning values in use."""
         return self._config
 
     @property
     def goal(self) -> Optional[Goal]:
-        """The most recent goal handed out, or None before the first one."""
+        """Return the most recent goal handed out, or None before the first one."""
         return self._goal
 
     @property
     def arrived(self) -> bool:
-        """True once the robot has reached the end of the route."""
+        """Return True once the robot has reached the end of the route."""
         return self._arrived
 
     @property
     def crossings(self) -> tuple:
-        """The crossings in use (validated, sorted, merged), as RouteCrossing."""
+        """Return the crossings in use (validated, sorted, merged)."""
         return self._crossings
 
     @property
@@ -211,18 +269,42 @@ class RouteFollower:
         return self._next_crossing if self._next_crossing < len(self._crossings) else -1
 
     @property
+    def stop_offset(self) -> float:
+        """How far (m) the next crossing's stop is moved earlier for uncertainty."""
+        return self._stop_offset
+
+    @property
+    def active_stop_s(self) -> Optional[float]:
+        """Stop point (s) in use for the next crossing (after any shift), or None."""
+        return self._active_stop_s()
+
+    @property
+    def off_route(self) -> bool:
+        """Return True while the robot counts as off the route (last update)."""
+        return self._off_route
+
+    @property
     def waiting_at_crossing(self) -> bool:
-        """True if the robot is waiting at a crossing (as of the last update)."""
+        """Return True if the robot is waiting at a crossing (last update)."""
         return self._last_s is not None and self._is_waiting(self._last_s)
 
-    def update(self, x: float, y: float) -> FollowerOutput:
-        """Process one robot position (map frame, metres).
+    def update(self, x: float, y: float, sigma: float = 0.0,
+               now: Optional[float] = None) -> FollowerOutput:
+        """Process one robot position (route frame, metres).
+
+        Args:
+            x, y: The robot's position.
+            sigma: Uncertainty (1 sigma, m) of that position; 0 = exact.
+            now: Time (s) of the position, for off-route detection; None
+                disables it.
 
         Raises:
-            ValueError: If x or y is not finite.
+            ValueError: If x or y is not finite, or sigma is negative / NaN.
         """
         if not (math.isfinite(x) and math.isfinite(y)):
             raise ValueError(f'robot position must be finite, got ({x}, {y})')
+        if not sigma >= 0.0:
+            raise ValueError(f'sigma must be >= 0, got {sigma}')
         cfg = self._config
         route = self._route
 
@@ -242,9 +324,13 @@ class RouteFollower:
         # 2. Arrival needs both conditions, so a route that loops back to its
         #    start is not "arrived" at the beginning. Latched once true.
         if not self._arrived:
-            near_end = math.dist((x, y), route.points[-1]) <= cfg.arrival_tolerance
-            if remaining <= cfg.arrival_tolerance and near_end:
+            tolerance = max(cfg.arrival_tolerance, cfg.arrival_sigma_factor * sigma)
+            near_end = math.dist((x, y), route.points[-1]) <= tolerance
+            if remaining <= tolerance and near_end:
                 self._arrived = True
+
+        # 2b. Move the next crossing's stop earlier if the position is uncertain.
+        self._update_stop_offset(s, sigma)
 
         # 3-5. Choose a goal and decide whether to hand it out.
         new_goal = None
@@ -260,6 +346,11 @@ class RouteFollower:
         last = self._next_crossing - 1       # most recently confirmed crossing
         on_crossing = (last >= 0 and
                        self._crossings[last].start_s <= s <= self._crossings[last].end_s)
+        waiting = self._is_waiting(s)
+
+        # 7. Off-route detection (only with a time, see the module docstring).
+        self._update_off_route(abs(projection.cross_track_error), sigma, now,
+                               on_crossing or waiting)
 
         return FollowerOutput(
             s=s,
@@ -269,15 +360,72 @@ class RouteFollower:
             total_length=route.total_length,
             arrived=self._arrived,
             new_goal=new_goal,
-            waiting_at_crossing=self._is_waiting(s),
+            waiting_at_crossing=waiting,
             on_crossing=on_crossing,
             next_crossing_index=next_index,
             distance_to_next_crossing=(
                 self._crossings[next_index].start_s - s if next_index >= 0 else 0.0),
+            off_route=self._off_route,
         )
 
+    def _update_stop_offset(self, s: float, sigma: float) -> None:
+        """Move the next crossing's stop earlier by about 3 sigma (see FollowerConfig).
+
+        The shift grows as soon as sigma calls for more (rounded up to
+        stop_sigma_step). It shrinks only when sigma calls for at least two steps
+        less, and never within stop_latch_distance of the static stop: a sigma
+        hovering at a rounding boundary must not make the stop goal (and Nav2's
+        goal) flip back and forth. If a larger shift puts the stop behind the
+        robot, the robot stops where it is.
+        """
+        cfg = self._config
+        index = self._next_crossing
+        if index >= len(self._stop_s):
+            return
+        step = cfg.stop_sigma_step
+        excess = max(0.0, cfg.stop_sigma_factor * (sigma - cfg.stop_sigma_included))
+        wanted = math.ceil(excess / step - 1e-9) * step
+        offset = self._stop_offset
+        if excess > offset:
+            offset = wanted                                  # more caution: at once
+        elif (excess <= offset - 2.0 * step
+              and self._stop_s[index] - s > cfg.stop_latch_distance):
+            offset = wanted                                  # clearly less, and far away
+        grew = offset > self._stop_offset
+        self._stop_offset = offset
+        if grew and s > self._shifted_stop(index):
+            self._stop_floor = s if self._stop_floor is None else min(self._stop_floor, s)
+
+    def _shifted_stop(self, index: int) -> float:
+        """Return the static stop minus the offset, never before the last far kerb."""
+        static = self._stop_s[index]
+        stop = static - self._stop_offset
+        if index > 0:
+            # min(..., static): a static stop already before that far kerb (islands,
+            # see stop_points) stays exactly where it is.
+            stop = max(stop, min(self._crossings[index - 1].end_s, static))
+        return min(stop, static)
+
+    def _update_off_route(self, error: float, sigma: float, now: Optional[float],
+                          at_crossing: bool) -> None:
+        """Update the off-route state from the cross-track error (with hysteresis)."""
+        cfg = self._config
+        if now is None or at_crossing or sigma > cfg.off_route_max_sigma:
+            self._off_since = None
+            return            # not judged: keep the current state
+        if error < cfg.back_on_route_distance:
+            self._off_route = False
+            self._off_since = None
+        elif error > cfg.off_route_distance:
+            if self._off_since is None:
+                self._off_since = now
+            if now - self._off_since >= cfg.off_route_time:
+                self._off_route = True
+        else:
+            self._off_since = None   # in between: no change, and the timer restarts
+
     def confirm_crossing(self) -> bool:
-        """The user says go: release the crossing the robot is waiting at.
+        """Release the crossing the robot is waiting at (the user said go).
 
         Accepted only while waiting (see FollowerOutput.waiting_at_crossing,
         as of the last update). A go given anywhere else is rejected, never
@@ -294,8 +442,9 @@ class RouteFollower:
         self._next_crossing += 1
         self._stop_reached = False
         self._exit_s = crossing.end_s
+        self._stop_offset = 0.0        # the next crossing starts with its own shift
+        self._stop_floor = None
         return True
-
 
     def confirm_goal_reached(self, x: float, y: float) -> bool:
         """Tell the follower that Nav2 reached the goal at (x, y) (map frame, metres).
@@ -336,7 +485,6 @@ class RouteFollower:
             self._released_s = goal.s
             released = True
         return released
-
 
     def _release_corners(self, s: float) -> None:
         """Release every corner the robot is within corner_release_distance of.
@@ -379,7 +527,7 @@ class RouteFollower:
                 self._released_s = corner_s
 
     def _is_waiting(self, s: float) -> bool:
-        """True if the robot at progress s is waiting at the next crossing's stop.
+        """Return True if the robot at progress s waits at the next crossing's stop.
 
         Waiting starts crossing_wait_distance before the stop point, but never
         before the far kerb of the crossing just crossed: on a narrow island
@@ -400,10 +548,18 @@ class RouteFollower:
         return s >= threshold
 
     def _active_stop_s(self) -> Optional[float]:
-        """Return the stop point (s) of the first unreleased crossing, or None."""
-        if self._next_crossing < len(self._stop_s):
-            return self._stop_s[self._next_crossing]
-        return None
+        """Return the stop point (s) in use for the first unreleased crossing, or None.
+
+        That is the static stop point, moved earlier for position uncertainty
+        (_update_stop_offset), but never behind where the robot already was.
+        """
+        index = self._next_crossing
+        if index >= len(self._stop_s):
+            return None
+        stop = self._shifted_stop(index)
+        if self._stop_floor is not None:
+            stop = min(self._stop_s[index], max(stop, self._stop_floor))
+        return stop
 
     def _crossing_heading(self, crossing: RouteCrossing) -> float:
         """Direction (rad) from the near kerb to the far kerb of a crossing."""

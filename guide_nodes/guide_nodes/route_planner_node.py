@@ -4,33 +4,36 @@ Serves guide/plan_route (guide_interfaces/srv/PlanRoute). All routing
 decisions live in guide_core.route_planner; this node only loads the graph,
 converts between ROS messages and guide_core types, and publishes things to
 look at in RViz.
+
+Frames (Step 8): the planned path and the graph markers are in route_frame
+(default 'enu': metres east / north of the configured origin), not in the SLAM
+map frame. The simulator broadcasts TF enu -> map so RViz can show them.
 """
 
+from collections import Counter
+from dataclasses import fields
 import math
 import os
 import sys
 import time
-from collections import Counter
-from dataclasses import fields
 
+from geometry_msgs.msg import Point, PoseStamped
+from guide_core.angles import yaw_to_quaternion
+from guide_core.geo import latlon_to_enu
+from guide_core.route_planner import PlannerConfig, PlanningError, RoutePlanner
+from guide_core.walk_costs import (
+    classify_crossing, CostConfig, CrossingType, walkway_class, WalkwayClass,
+)
+from guide_interfaces.msg import RouteCrossing
+from guide_interfaces.srv import PlanRoute
+from nav_msgs.msg import Path
 import osmnx as ox
 import rclpy
-from geometry_msgs.msg import Point, PoseStamped
-from nav_msgs.msg import Path
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from std_msgs.msg import ColorRGBA
 from visualization_msgs.msg import Marker, MarkerArray
-
-from guide_core.angles import yaw_to_quaternion
-from guide_core.geo import latlon_to_enu
-from guide_core.route_planner import PlannerConfig, PlanningError, RoutePlanner
-from guide_core.walk_costs import (
-    CostConfig, CrossingType, WalkwayClass, classify_crossing, walkway_class,
-)
-from guide_interfaces.msg import RouteCrossing
-from guide_interfaces.srv import PlanRoute
 
 # Latched QoS for rarely-changing state topics: RELIABLE (every message
 # arrives) + TRANSIENT_LOCAL (the publisher keeps the last message and hands
@@ -52,7 +55,7 @@ class StartupError(Exception):
 
 
 def make_marker(ns, marker_type, points, rgba, scale, frame_id, stamp):
-    """Build one RViz Marker from a list of (x, y) points in the map frame.
+    """Build one RViz Marker from a list of (x, y) points in the route (enu) frame.
 
     LINE_LIST draws a separate line between each consecutive pair of points
     (scale.x = line width in metres). SPHERE_LIST draws a sphere at every
@@ -65,7 +68,7 @@ def make_marker(ns, marker_type, points, rgba, scale, frame_id, stamp):
     marker.id = 0           # (ns, id) identifies a marker; re-publishing replaces it
     marker.type = marker_type
     marker.action = Marker.ADD
-    marker.pose.orientation.w = 1.0  # identity pose: points are already in map coordinates
+    marker.pose.orientation.w = 1.0  # identity pose: points are already in frame_id
     marker.scale.x = marker.scale.y = marker.scale.z = scale
     marker.color = ColorRGBA(r=rgba[0], g=rgba[1], b=rgba[2], a=rgba[3])
     marker.points = [Point(x=x, y=y, z=0.0) for x, y in points]
@@ -137,7 +140,7 @@ class RoutePlannerNode(Node):
         self.declare_parameter('graph_file', '')
         self.declare_parameter('origin_lat', 51.4988)
         self.declare_parameter('origin_lon', -0.1749)
-        self.declare_parameter('map_frame', 'map')
+        self.declare_parameter('route_frame', 'enu')   # frame of paths and markers
         self.declare_parameter('max_snap_distance', defaults.max_snap_distance)
         self.declare_parameter('walkway_snap_distance', defaults.walkway_snap_distance)
         self.declare_parameter('goal_snap_slack', defaults.goal_snap_slack)
@@ -152,7 +155,7 @@ class RoutePlannerNode(Node):
         self.declare_parameter('publish_graph', True)
 
         graph_file = os.path.expanduser(self.get_parameter('graph_file').value)
-        self._map_frame = self.get_parameter('map_frame').value
+        self._route_frame = self.get_parameter('route_frame').value
         origin = (self.get_parameter('origin_lat').value, self.get_parameter('origin_lon').value)
         try:
             costs = CostConfig(**{f.name: self.get_parameter(f.name).value
@@ -194,7 +197,7 @@ class RoutePlannerNode(Node):
 
         if self.get_parameter('publish_graph').value:
             markers, counts = build_graph_markers(
-                graph, origin, self._map_frame, self.get_clock().now().to_msg())
+                graph, origin, self._route_frame, self.get_clock().now().to_msg())
             self._graph_pub.publish(markers)
             self.get_logger().info('Published guide/osm_graph: ' +
                                    ', '.join(f'{v} {k}' for k, v in counts.items()))
@@ -264,14 +267,14 @@ class RoutePlannerNode(Node):
         return response
 
     def _to_path(self, route, stamp):
-        """Convert a guide_core Route into a nav_msgs/Path in the map frame.
+        """Convert a guide_core Route into a nav_msgs/Path in the route (enu) frame.
 
         Each pose's orientation is the heading of the segment starting at it
         (the last pose keeps the final segment's heading). Headings follow
         REP 103: 0 = east, counter-clockwise positive.
         """
         path = Path()
-        path.header.frame_id = self._map_frame
+        path.header.frame_id = self._route_frame
         path.header.stamp = stamp
         points = route.points
         for i, (x, y) in enumerate(points):
