@@ -8,20 +8,17 @@ Nav2 and localisation must already be running; navigation_sim.launch.py starts e
 import os
 
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, ExecuteProcess
+from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration
-
-# the navigation_nodes folder (this file is in navigation_nodes/launch/thisfile.py, so it's two dirnames up)
-NODES_DIR = os.path.dirname(os.path.dirname(os.path.realpath(__file__))) # realpath works even with the symlink thing 
+from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 
 def node(script, *params):
     """Run one of the node scripts, giving it the launch arguments named in params as ROS parameters."""
-    # this builds the same command as typing:  python3 places_node.py --ros-args -p places_file:=... -p ...
-    cmd = ['python3', os.path.join(NODES_DIR, script), '--ros-args']
-    for name in params:
-        cmd += ['-p', [f'{name}:=', LaunchConfiguration(name)]]
-    return ExecuteProcess(cmd=cmd, output='screen')  # output='screen' shows the node's prints in this terminal
+    parameter_types = {'use_sim_time': bool, 'tracker_domain': int}
+    parameters = {name: ParameterValue(LaunchConfiguration(name), value_type=parameter_types.get(name, str)) for name in params}
+    return Node(package='navigation_nodes', executable=script.removesuffix('.py'), parameters=[parameters], output='screen')
 
 
 def generate_launch_description():

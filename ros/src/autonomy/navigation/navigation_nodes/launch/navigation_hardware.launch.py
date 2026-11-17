@@ -12,9 +12,9 @@ from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 
 
-LAUNCH_DIR = os.path.dirname(os.path.realpath(__file__))
-NAVIGATION_DIR = os.path.abspath(os.path.join(LAUNCH_DIR, '..', '..'))
-SLAM_DIR = os.path.join(os.path.dirname(NAVIGATION_DIR), 'slam')
+NAVIGATION_DIR = get_package_share_directory('navigation_nodes')
+LAUNCH_DIR = os.path.join(NAVIGATION_DIR, 'launch')
+SLAM_DIR = os.path.join(NAVIGATION_DIR, 'resources', 'autonomy', 'slam')
 
 
 def launch_hardware(context):
