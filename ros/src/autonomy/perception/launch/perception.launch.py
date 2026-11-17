@@ -16,6 +16,8 @@ def generate_launch_description():
         cmd=['python3', os.path.join(perception_dir, 'scene_description.py')],
         output='screen',
     )
+    # YOLO, loaded once: object detection and the people tracker both ask this server
+    yolo = ExecuteProcess(cmd=['python3', '-u', os.path.join(perception_dir, 'yolo_server.py')], output='screen')
     detection = ExecuteProcess(
         cmd=['python3', os.path.join(perception_dir, 'object_detection.py'), '--ros-args', '-p', ['search_time:=', LaunchConfiguration('search_time')]],
         output='screen',
@@ -27,6 +29,6 @@ def generate_launch_description():
         # The Femto Bolt node from hardware/camera, when nothing else runs the camera
         IncludeLaunchDescription(PythonLaunchDescriptionSource(os.path.normpath(camera_launch)), condition=IfCondition(LaunchConfiguration('camera'))),
         description,
-        # Start detection once Qwen has loaded, or on the Jetson YOLO pushes Qwen onto the CPU
-        RegisterEventHandler(OnProcessIO(target_action=description, on_stdout=lambda event: [detection] if b'scene_description ready' in event.text else None)),
+        # Start YOLO once the local language model has loaded, or on the Jetson YOLO pushes it onto the CPU
+        RegisterEventHandler(OnProcessIO(target_action=description, on_stdout=lambda event: [yolo, detection] if b'scene_description ready' in event.text else None)),
     ])

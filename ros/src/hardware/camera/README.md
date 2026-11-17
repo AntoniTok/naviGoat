@@ -1,6 +1,13 @@
 # Camera: Orbbec Femto Bolt
 
-[camera.py](camera.py) is a ROS 2 node that reads the Femto Bolt through the Orbbec SDK (`pyorbbecsdk2`, in the `PETE=true` image) and publishes:
+[launch/camera.launch.py](launch/camera.launch.py) starts the camera the same way as the people tracker's [jetson_pipeline.sh](../../autonomy/perception/social_perception/jetson_pipeline.sh), so both use one camera setup:
+
+1. the Orbbec ROS 2 driver (`ros2 launch orbbec_camera femto_bolt.launch.py depth_registration:=false`),
+2. depth registration as its own node (`depth_image_proc register_node`), which aligns depth to colour.
+
+If either exits, the launch stops, as in the pipeline. It needs the `SOCIAL=true` image (the default), which has both packages.
+
+`driver:=sdk` starts the old [camera.py](camera.py) instead: one node that reads the camera through the Orbbec SDK (`pyorbbecsdk2`, in the `PETE=true` image). The table below is what `camera.py` publishes; with the Orbbec driver the first three topics are the same, and the point cloud and the small preview are not published.
 
 | Topic | Type | |
 | --- | --- | --- |
@@ -10,7 +17,7 @@
 | `/camera/points` | `sensor_msgs/PointCloud2` | XYZ points in metres, published when subscribed |
 | `/camera/color/image_raw/compressed` | `sensor_msgs/CompressedImage` | small 640 px jpeg preview, for watching from another computer |
 
-All are best effort. Colour and depth of a frame share the same timestamp. Perception ([autonomy/perception](../../autonomy/perception)) and the people tracker both use these topics. Only one program can open the camera, so run either this node or the Orbbec ROS 2 driver, not both.
+All are best effort. Colour and depth of a frame share the same timestamp. Perception ([autonomy/perception](../../autonomy/perception)) and the people tracker both use these topics. Only one program can open the camera: do not run this launch file together with `jetson_pipeline.sh`, which starts the same driver itself.
 
 ## Run
 

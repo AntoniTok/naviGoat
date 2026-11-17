@@ -20,7 +20,9 @@ from std_msgs.msg import String
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'core'))
 import llm  # noqa: E402
 VLM_MODEL = llm.LOCAL_MODEL
-CAMERA_QOS = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
+# The camera's pictures are asked for reliably. Asked for as best effort, nearly every 2.7 MB colour picture from the
+# Orbbec driver was lost on the way (measured on the Jetson: 0.6 a second arrived, against 20 when reliable).
+CAMERA_QOS = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE)
 
 SYSTEM_PROMPT = """You are Pete, a guide robot for a blind or low-vision person. \
 You see through your forward-facing camera, which points the way the person is heading.

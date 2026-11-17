@@ -90,6 +90,8 @@ ros2 launch /workspace/ros/src/core/launch/pete.launch.py
 | `camera` | `true` | `false` when the Orbbec ROS 2 driver runs the camera instead |
 | `search_time` | `5.0` | seconds object detection looks for a goal |
 | `use_qwen` | `true` | as above. Here it is on by default: Ollama runs in the same container for scene description, so the middleman shares that loaded Qwen |
+| `people` | `false` | `true` also starts the people tracker (`femto_person_tracker`, publishes `/social_perception/tracks`) and its dashboard, from [social_perception](../autonomy/perception/social_perception). They use the camera Pete already runs, and the tracker uses perception's [YOLO server](../autonomy/perception/yolo_server.py) instead of loading its own model. Needs the `SOCIAL=true` image |
+| `people_port` | `8766` | the dashboard's port. Not 8765: that is Whisper's |
 | `voice` | `false` | `true` also starts the voice node. It needs the `VOICE=true` image and the host's sound socket (see `start_voice_ros.sh`); the voice launch file starts the middleman itself, so it is never started twice |
 | `whisper_url`, `listen`, `device` | as in the voice launch file | passed on to the voice node |
 

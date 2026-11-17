@@ -5,6 +5,7 @@ Pete's perception is two ROS 2 nodes. The middle man (not part of perception) te
 | Node | Runs when | Does |
 | --- | --- | --- |
 | [object_detection.py](object_detection.py) | `/mode` is `perception` | Looks for the `/goal` object with YOLO-World and publishes where it is for navigation, or that it is not there |
+| [yolo_server.py](yolo_server.py) | always, started by the launch file | Holds YOLO-World on the GPU, loaded once, and answers requests on `http://127.0.0.1:8767`, the way Ollama serves the language model. Object detection asks it during a search; the people tracker asks it the rest of the time (`--yolo-url`) and waits while a search runs. Neither node loads PyTorch or a model itself |
 | [scene_description.py](scene_description.py) | `/mode` switches to `description` | Describes the camera image with the Qwen3-VL vision model, for the speech interface to say |
 
 ## Topics
