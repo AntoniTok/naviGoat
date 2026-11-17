@@ -28,6 +28,12 @@ ros2 launch handle_nodes handle_launch.py
 - Data: `[side, magnitude]`, where side is `0` for left, `1` for right, `2` for forward or `3` for back and magnitude is 0 to 255.
 - BLE output: `<l:180>`, `<r:180>`, `<f:180>` or `<b:180>`. Each message sends one frame.
 - ESP32 BLE device name: `naviGoatWristband`.
+- BLE service UUID: `0bbbe0d0-3a64-4f83-bc35-64314a26cb60`.
+- BLE write characteristic UUID: `0bbbe0d1-3a64-4f83-bc35-64314a26cb60`.
+- ESP32-C3 Super Mini PlatformIO firmware, pin mapping and standalone motor test:
+  [firmware/wristband](../../../firmware/wristband/README.md).
+- Refresh each active motor within 2 seconds to keep it running; magnitude 0
+  stops that motor immediately. All motors stop on BLE disconnect.
 
 Mount the host Bluetooth D-Bus socket when starting the container:
 

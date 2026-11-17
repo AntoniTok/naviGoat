@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
-"""When /mode switches to 'perception', looks for the /goal object with YOLO-World and publishes where it was last seen."""
+"""When /mode switches to 'perception', looks for the /goal object with YOLO-World and publishes where it was last seen.
+
+YOLO itself runs in yolo_server.py, which the people tracker uses too: this node sends it the part of the picture to look
+at and gets the boxes back, so it loads no PyTorch or model of its own.
+"""
 
 import collections
+import json
 import math
 import os
 import random
 import sys
 import threading
 import time
+import urllib.request
 
 import cv2
 import numpy as np
@@ -19,8 +25,10 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import CameraInfo, CompressedImage, Image
 from std_msgs.msg import String
 
-YOLO_MODEL = os.environ.get('PETE_YOLO_MODEL', 'yolov8s-worldv2.pt')
-CAMERA_QOS = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)  # newest frame only
+CAMERA_QOS = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)  # newest frame only; for the preview it sends
+# The camera's pictures are asked for reliably. Asked for as best effort, nearly every 2.7 MB colour picture from the
+# Orbbec driver was lost on the way (measured on the Jetson: 0.6 a second arrived, against 20 when reliable).
+IMAGE_QOS = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE)
 
 # The word lists are shared with the middleman (core/catalog.py), so both always know the same objects
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'core'))
@@ -72,16 +80,10 @@ class ObjectDetection(Node):
         self.target_box = None  # its last box in pixels: while following it, YOLO looks at a crop around it
         self.target_seen = 0.0
 
-        from ultralytics import YOLOWorld
-        self.model = YOLOWorld(param('model_path', YOLO_MODEL))
-        self.vocabulary = list(KNOWN)
-        self.model.set_classes(self.vocabulary)
-        self.list_features = self.model.model.txt_feats.clone()  # for every word in KNOWN
-        self.use_words(VOCABULARY)
+        self.yolo_url = param('yolo_url', 'http://127.0.0.1:8767')  # yolo_server.py
+        self.vocabulary = None  # the word list the YOLO server was last given by this node
         self.wanted = list(VOCABULARY)  # the list the goal needs; differs from vocabulary while a new word is learnt
         self.learning = False
-        for h, w in ((720, 1280), (396, 704), (360, 640)):
-            self.model.predict(np.zeros((h, w, 3), np.uint8), imgsz=self.image_size, verbose=False)
         self.hits = 0  # sightings of the followed object
         self.look = 0  # counts YOLO looks: even = whole frame, odd = the next quarter
         self.bridge = CvBridge()
@@ -98,9 +100,9 @@ class ObjectDetection(Node):
         self.preview_pub = self.create_publisher(CompressedImage, param('preview_topic', '/object_detection/image/compressed'), CAMERA_QOS)
         self.create_subscription(String, param('mode_topic', '/mode'), self.on_mode, 10)
         self.create_subscription(String, param('goal_topic', '/goal'), self.on_goal, 10)
-        self.create_subscription(Image, param('image_topic', '/camera/color/image_raw'), self.on_image, CAMERA_QOS)
-        self.create_subscription(Image, param('depth_topic', '/camera/depth_registered/image_rect'), self.on_depth, CAMERA_QOS)
-        self.create_subscription(CameraInfo, param('camera_info_topic', '/camera/color/camera_info'), self.on_info, CAMERA_QOS)
+        self.create_subscription(Image, param('image_topic', '/camera/color/image_raw'), self.on_image, IMAGE_QOS)
+        self.create_subscription(Image, param('depth_topic', '/camera/depth_registered/image_rect'), self.on_depth, IMAGE_QOS)
+        self.create_subscription(CameraInfo, param('camera_info_topic', '/camera/color/camera_info'), self.on_info, IMAGE_QOS)
         self.get_logger().info(f"Object detection ready. It searches while the mode is '{self.mode_name}'.")
 
     def on_mode(self, msg):
@@ -123,8 +125,8 @@ class ObjectDetection(Node):
             else:  # Any other word still works. Words inside it are left out, or 'chair' would win every 'armchair' box.
                 self.wanted = [w for w in VOCABULARY if w not in self.goal] + [self.goal]
             if self.goal in KNOWN and not self.learning:
-                self.use_words(self.wanted)  # instant: these words' numbers are kept from launch
-            elif self.wanted != self.vocabulary and not self.learning:
+                self.use_words(self.wanted)  # instant: the server keeps these words' numbers from launch
+            if self.wanted != self.vocabulary and not self.learning:  # a new word, or the server did not answer
                 self.learning = True
                 threading.Thread(target=self.learn, daemon=True).start()
         if self.mode == self.mode_name:
@@ -141,21 +143,36 @@ class ObjectDetection(Node):
         if self.mode == self.mode_name:
             self.start_search()
 
+    def ask_yolo(self, path, data, timeout):
+        """The YOLO server's JSON answer, or None (with a warning) when it cannot be reached or reports an error."""
+        try:
+            with urllib.request.urlopen(urllib.request.Request(self.yolo_url + path, data=data), timeout=timeout) as reply:
+                answer = json.loads(reply.read())
+        except (OSError, ValueError) as error:
+            answer = {'error': f'not reachable ({error})'}
+        if 'error' in answer:
+            self.get_logger().warn(f"YOLO server at {self.yolo_url}: {answer['error']}. Is yolo_server.py running?", throttle_duration_sec=5.0)
+            return None
+        return answer
+
     def use_words(self, words):
-        """Point YOLO at a word list: list words reuse their numbers from launch, any other word is worked out now."""
+        """Point YOLO at a word list: list words are instant, any other word is worked out by the server first (seconds)."""
         if words == self.vocabulary:
             return
-        import torch
-        parts = [self.list_features[:, [KNOWN.index(w) for w in words if w in KNOWN]]]
-        new = [w for w in words if w not in KNOWN]
-        if new:
-            parts.append(self.model.model.get_text_pe(new).to(self.list_features))
-        world = self.model.model
-        world.txt_feats = torch.cat(parts, dim=1)
-        world.model[-1].nc = len(words)
-        self.model.model.names = list(words)
-        self.model.predictor = None  # rebuilt on the next prediction, with the new number of words
+        if self.ask_yolo('/words', json.dumps(list(words)).encode(), timeout=120) is None:
+            time.sleep(1.0)  # the caller tries again while the list is still the wrong one
+            return
         self.vocabulary = list(words)
+
+    def detect(self, image):
+        """Boxes [x1, y1, x2, y2, confidence, word] in a picture. It is sent no larger than YOLO looks at it (longest side
+        image_size), which keeps the request small, and the boxes are scaled back."""
+        scale = min(1.0, self.image_size / max(image.shape[:2]))
+        small = cv2.resize(image, (round(image.shape[1] * scale), round(image.shape[0] * scale))) if scale < 1 else image
+        scale = small.shape[1] / image.shape[1]
+        answer = self.ask_yolo(f'/detect?w={small.shape[1]}&h={small.shape[0]}&imgsz={self.image_size}&conf={self.confidence}&search=1',
+                               np.ascontiguousarray(small).tobytes(), timeout=10)
+        return [[c / scale for c in box[:4]] + box[4:] for box in answer['boxes']] if answer else []
 
     def start_search(self):
         if not self.goal:
@@ -235,11 +252,8 @@ class ObjectDetection(Node):
         """(PointStamped of the followed object or None, goal boxes as (xyxy, conf), the chosen box, the region looked at)."""
         region = self.next_region(frame.shape)
         x0, y0, x1, y1 = region
-        result = self.model.predict(frame[y0:y1, x0:x1], imgsz=self.image_size, conf=self.confidence, verbose=False)[0]
-        goal = self.vocabulary.index(self.goal)
-        boxes = sorted((([b[0] + x0, b[1] + y0, b[2] + x0, b[3] + y0], p)  # back to whole-frame pixels
-                        for b, p, c in zip(result.boxes.xyxy.tolist(), result.boxes.conf.tolist(), result.boxes.cls.tolist())
-                        if int(c) == goal), key=lambda b: -b[1])  # the goal only; other words just compete
+        boxes = sorted((([b[0] + x0, b[1] + y0, b[2] + x0, b[3] + y0], b[4])  # back to whole-frame pixels
+                        for b in self.detect(frame[y0:y1, x0:x1]) if b[5] == self.goal), key=lambda b: -b[1])  # the goal only; other words just compete
         if not boxes:
             return None, boxes, None, region  # a look that missed it (e.g. another quarter) doesn't undo the sightings
         if self.intrinsics is None:

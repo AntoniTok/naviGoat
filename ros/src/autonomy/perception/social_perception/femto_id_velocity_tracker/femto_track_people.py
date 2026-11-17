@@ -20,6 +20,7 @@ import json
 import os
 import threading
 import time
+import urllib.request
 from dataclasses import asdict
 
 import cv2
@@ -31,7 +32,6 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, HistoryPolicy, ReliabilityPolicy, DurabilityPolicy
 from sensor_msgs.msg import CameraInfo, Image
 from std_msgs.msg import String
-from ultralytics import YOLO, YOLOWorld
 
 from tracker2d import Tracker2D
 
@@ -40,26 +40,57 @@ def stamp_s(msg):
     return float(msg.header.stamp.sec) + float(msg.header.stamp.nanosec) * 1e-9
 
 
+class RemoteBox:
+    def __init__(self, box):
+        self.xyxy = np.array([box[:4]], dtype=np.float32)
+        self.conf = box[4]
+
+
+class RemoteResult:
+    """The part of an Ultralytics result this file uses, for boxes that came from --yolo-url."""
+
+    def __init__(self, image, boxes, inference_ms):
+        self.image = image
+        self.boxes = [RemoteBox(box) for box in boxes]
+        self.speed = {"inference": inference_ms}
+
+    def plot(self):
+        annotated = self.image.copy()
+        for box in self.boxes:
+            x1, y1, x2, y2 = (int(v) for v in box.xyxy[0])
+            cv2.rectangle(annotated, (x1, y1), (x2, y2), (255, 140, 0), 2)
+        return annotated
+
+
 class FemtoPersonTracker(Node):
     def __init__(self, args):
         super().__init__("femto_person_tracker")
         self.args = args
         self.bridge = CvBridge()
-        import torch
-        if args.threads is not None:
-            torch.set_num_threads(args.threads)
-        self.device = (
-            "cuda:0" if args.device == "auto" and torch.cuda.is_available()
-            else "cpu" if args.device == "auto"
-            else args.device
-        )
-        # Open-vocabulary .pt: specify person class explicitly. Other checkpoints
-        # (including TensorRT exports) must already have person at class index 0.
-        if "world" in os.path.basename(args.model).lower() and args.model.endswith(".pt"):
-            self.model = YOLOWorld(args.model)
-            self.model.set_classes(["person"])
+        self._last_wait_log = 0.0
+        if args.yolo_url:
+            # Pete's yolo_server.py (ros/src/autonomy/perception) already has YOLO on the GPU for object detection:
+            # asking it means this process loads no PyTorch, CUDA or model at all (about 1.4 GB less on the Jetson).
+            # Without --yolo-url nothing changes.
+            self.model = None
+            self.device = args.yolo_url
         else:
-            self.model = YOLO(args.model)
+            import torch
+            from ultralytics import YOLO, YOLOWorld
+            if args.threads is not None:
+                torch.set_num_threads(args.threads)
+            self.device = (
+                "cuda:0" if args.device == "auto" and torch.cuda.is_available()
+                else "cpu" if args.device == "auto"
+                else args.device
+            )
+            # Open-vocabulary .pt: specify person class explicitly. Other checkpoints
+            # (including TensorRT exports) must already have person at class index 0.
+            if "world" in os.path.basename(args.model).lower() and args.model.endswith(".pt"):
+                self.model = YOLOWorld(args.model)
+                self.model.set_classes(["person"])
+            else:
+                self.model = YOLO(args.model)
         self.tracker = Tracker2D(
             gate_m=args.gate, max_age_s=args.max_age,
             min_hits=args.min_hits,
@@ -78,9 +109,11 @@ class FemtoPersonTracker(Node):
         self._warned_shape = False
         self._warned_depth = False
 
+        # RELIABLE, still newest-only: as BEST_EFFORT nearly every 2.7 MB colour image from the Orbbec driver was
+        # lost when other nodes read the camera too (measured on the Jetson: 0.6/s arrived, against 20/s reliable).
         qos = QoSProfile(
             history=HistoryPolicy.KEEP_LAST, depth=1,
-            reliability=ReliabilityPolicy.BEST_EFFORT,
+            reliability=ReliabilityPolicy.RELIABLE,
             durability=DurabilityPolicy.VOLATILE,
         )
         self.create_subscription(
@@ -148,6 +181,36 @@ class FemtoPersonTracker(Node):
             self._latest_pair = (rgb_msg, depth_msg, time.monotonic())
             self._new_pair.set()
 
+    def remote_predict(self, bgr):
+        """People's boxes from the YOLO that --yolo-url points at, or None when it cannot answer now.
+
+        The picture is sent at the size YOLO would shrink it to anyway (longest side = imgsz), which keeps the
+        request small, and the boxes are scaled back to the full picture.
+        """
+        scale = self.args.imgsz / max(bgr.shape[:2])
+        small = cv2.resize(
+            bgr, (round(bgr.shape[1] * scale), round(bgr.shape[0] * scale)),
+            interpolation=cv2.INTER_LINEAR
+        ) if scale < 1 else bgr
+        scale = small.shape[1] / bgr.shape[1]
+        url = (f"{self.args.yolo_url}/detect?w={small.shape[1]}&h={small.shape[0]}"
+               f"&conf={self.args.conf}&imgsz={self.args.imgsz}&only=person&yield=1")
+        why = None
+        try:
+            with urllib.request.urlopen(urllib.request.Request(url, data=small.tobytes()), timeout=30) as reply:
+                answer = json.loads(reply.read())
+            if "boxes" in answer:
+                boxes = [[v / scale for v in box[:4]] + [box[4]] for box in answer["boxes"]]
+                return RemoteResult(bgr, boxes, answer.get("ms", 0.0))
+            why = "busy with an object search" if answer.get("busy") else f"error: {answer.get('error')}"
+        except OSError as exc:
+            why = f"not reachable yet ({exc})"
+            time.sleep(0.5)
+        if time.monotonic() - self._last_wait_log >= 5.0:
+            self._last_wait_log = time.monotonic()
+            self.get_logger().info(f"Shared YOLO at {self.args.yolo_url} is {why}; waiting.")
+        return None
+
     def process_loop(self):
         while not self._stop.is_set():
             if not self._new_pair.wait(timeout=0.1):
@@ -207,11 +270,16 @@ class FemtoPersonTracker(Node):
                 continue
 
             try:
-                result = self.model.predict(
-                    bgr, classes=[0], conf=self.args.conf,
-                    imgsz=self.args.imgsz, device=self.device,
-                    verbose=False
-                )[0]
+                if self.model is None:
+                    result = self.remote_predict(bgr)
+                    if result is None:
+                        continue  # the shared YOLO is not up yet, or busy with an object search
+                else:
+                    result = self.model.predict(
+                        bgr, classes=[0], conf=self.args.conf,
+                        imgsz=self.args.imgsz, device=self.device,
+                        verbose=False
+                    )[0]
             except Exception as exc:
                 self.get_logger().error(f"YOLO prediction error: {exc}")
                 continue
@@ -373,6 +441,9 @@ class FemtoPersonTracker(Node):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default="yolov8s-worldv2.pt")
+    parser.add_argument("--yolo-url", default="",
+                        help="use Pete's shared YOLO server (yolo_server.py, http://127.0.0.1:8767) "
+                             "instead of loading a model here")
     parser.add_argument("--imgsz", type=int, default=320)
     parser.add_argument("--conf", type=float, default=0.45)
     parser.add_argument("--slop", type=float, default=0.08,
