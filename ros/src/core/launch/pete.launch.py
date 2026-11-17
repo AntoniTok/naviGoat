@@ -28,6 +28,7 @@ def generate_launch_description():
         DeclareLaunchArgument('silence', default_value='1.0'),  # seconds of quiet that end a spoken phrase
         DeclareLaunchArgument('people', default_value='false'),  # true also tracks people, on /social_perception/tracks
         DeclareLaunchArgument('people_port', default_value='8766'),  # the dashboard's; 8765 is Whisper's
+        DeclareLaunchArgument('people_max_age', default_value='1.0'),  # seconds to retain an unobserved track; following uses 2.0
 
         # camera, scene description, then object detection once Qwen has loaded
         IncludeLaunchDescription(launch_file('autonomy', 'perception', 'launch', 'perception.launch.py'),
@@ -41,6 +42,6 @@ def generate_launch_description():
         # they read the camera topics that perception's camera already publishes, so no second driver is started
         # --yolo-url: the tracker asks perception's yolo_server.py, as object detection does, so YOLO is in memory once
         people('femto_track_people.py', '--yolo-url', 'http://127.0.0.1:8767', '--imgsz', '320', '--conf', '0.40',
-               '--max-age', '1.0', '--no-plot'),
+               '--max-age', arg('people_max_age'), '--no-plot'),
         people('social_tracking_dashboard.py', '--host', '0.0.0.0', '--port', arg('people_port')),
     ])

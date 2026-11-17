@@ -23,7 +23,7 @@ class FollowingModeBridge:
         self._seen_follow_requests = set()
 
     def _snapshot(self):
-        return FollowingOutput(self.machine.state, self.machine.command, self.machine.target_id)
+        return FollowingOutput(self.machine.state, self.machine.target_id)
 
     def handle_command(self, text: str) -> FollowingOutput:
         try:
@@ -59,7 +59,7 @@ class FollowingModeBridge:
         return replace(self.machine.disable(), event="command_invalid")
 
     def set_enabled(self, enabled: bool) -> FollowingOutput:
-        """Manual camera-test service; new manual sessions have no voice ID."""
+        """Manual enable service; new manual sessions have no voice ID."""
         if enabled:
             if self.machine.state == FollowingState.IDLE:
                 self.request_id = None

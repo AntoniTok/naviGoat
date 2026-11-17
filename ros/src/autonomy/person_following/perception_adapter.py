@@ -103,4 +103,4 @@ class PerceptionAdapter:
             raise PerceptionError("Clock mapping moved backwards; check clock synchronisation")
         self._last_source_stamp = stamp
         self._last_monotonic_stamp = mapped_stamp
-        return PerceptionFrame(mapped_stamp, tuple(people))
+        return PerceptionFrame(mapped_stamp, tuple(people), stamp)

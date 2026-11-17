@@ -14,7 +14,6 @@ from middleman_node import mode_payload
 from mode_bridge import FollowingModeBridge, ModeCommandError
 from state_machine import (FollowingState, FollowingStateMachine,
                            PerceptionFrame, PersonObservation)
-from velocity_controller import VelocityCommand
 
 
 class VoiceFollowingTests(unittest.TestCase):
@@ -39,7 +38,7 @@ class VoiceFollowingTests(unittest.TestCase):
         self.assertEqual(output.state, FollowingState.ACQUIRING)
         for stamp in (0.0, 0.25, 0.5):
             output = self.observe(stamp)
-        self.assertGreater(output.command.linear_mps, 0)
+        self.assertEqual(output.state, FollowingState.FOLLOWING)
         return output, command
 
     def test_starts_idle_and_voice_selects_nearest(self):
@@ -56,7 +55,7 @@ class VoiceFollowingTests(unittest.TestCase):
         self.assertTrue(command["stop"])
         self.assertEqual(command["mode"], "stop")
         self.assertEqual(output.state, FollowingState.IDLE)
-        self.assertEqual(output.command, VelocityCommand())
+        self.assertIsNone(output.target_id)
         self.assertEqual(self.middleman.mode, Mode.IDLE)
 
     def test_mode_switch_disables_following(self):
@@ -68,8 +67,8 @@ class VoiceFollowingTests(unittest.TestCase):
                 self.start()
                 output, command = self.speech(text)
                 self.assertEqual(command["mode"], mode)
-                self.assertEqual(output.command, VelocityCommand())
                 self.assertEqual(output.state, FollowingState.IDLE)
+                self.assertIsNone(output.target_id)
 
     def test_target_loss_round_trip_sets_middleman_idle_and_returns_idle_command(self):
         self.start()
@@ -82,7 +81,7 @@ class VoiceFollowingTests(unittest.TestCase):
         self.assertIn("lost the person", decision.reply)
         self.assertNotIn("Arrived", decision.reply)
         idle = mode_payload(decision.mode.value, request_id=decision.request_id)
-        self.assertEqual(self.bridge.handle_command(json.dumps(idle)).command, VelocityCommand())
+        self.assertEqual(self.bridge.handle_command(json.dumps(idle)).state, FollowingState.IDLE)
         self.assertIsNone(self.middleman.following_status(status))
 
     def test_perception_fault_and_stale_input_update_middleman(self):
@@ -95,6 +94,17 @@ class VoiceFollowingTests(unittest.TestCase):
                 decision = self.middleman.following_status(self.bridge.status_payload(output))
                 self.assertEqual(decision.mode, Mode.IDLE)
                 self.assertIn("Following stopped", decision.reply)
+
+    def test_nav2_and_transform_failures_are_correlated_and_spoken(self):
+        for event in ("navigation_unavailable", "navigation_failed", "transform_unavailable",
+                      "navigation_cancel_failed"):
+            with self.subTest(event=event):
+                self.setUp()
+                _, command = self.start()
+                status = dict(request_id=command["request_id"], state="IDLE", event=event)
+                decision = self.middleman.following_status(status)
+                self.assertEqual(decision.mode, Mode.IDLE)
+                self.assertNotIn("Arrived", decision.reply)
 
     def test_old_failure_cannot_cancel_new_following_request(self):
         _, old = self.start()
@@ -131,12 +141,12 @@ class VoiceFollowingTests(unittest.TestCase):
     def test_named_contact_is_rejected_instead_of_following_nearest(self):
         output, _ = self.speech("pete follow alice")
         self.assertEqual(output.event, "unsupported_target")
-        self.assertEqual(output.command, VelocityCommand())
+        self.assertEqual(output.state, FollowingState.IDLE)
         decision = self.middleman.following_status(self.bridge.status_payload(output))
         self.assertEqual(decision.mode, Mode.IDLE)
         self.assertIn("named contact", decision.reply)
 
-    def test_manual_camera_test_status_does_not_change_middleman(self):
+    def test_manual_session_status_does_not_change_middleman(self):
         self.middleman.handle("pete start following")
         output = self.bridge.set_enabled(True)
         self.assertIsNone(self.bridge.status_payload(output)["request_id"])
@@ -147,7 +157,7 @@ class VoiceFollowingTests(unittest.TestCase):
         output = self.bridge.set_enabled(False)
         self.assertEqual(self.middleman.following_status(self.bridge.status_payload(output)).mode, Mode.IDLE)
 
-    def test_malformed_command_requests_zero_and_reports_correlated_failure(self):
+    def test_malformed_command_disables_and_reports_correlated_failure(self):
         bad_commands = ("{", "[]", '{"mode":"follow","stop":"false"}',
                         '{"mode":"follow","stop":false,"target":""}')
         for text in bad_commands:
@@ -157,7 +167,7 @@ class VoiceFollowingTests(unittest.TestCase):
                 with self.assertRaises(ModeCommandError):
                     self.bridge.handle_command(text)
                 output = self.bridge.reject_command()
-                self.assertEqual(output.command, VelocityCommand())
+                self.assertEqual(output.state, FollowingState.IDLE)
                 self.assertEqual(output.event, "command_invalid")
                 self.assertEqual(self.middleman.following_status(self.bridge.status_payload(output)).mode, Mode.IDLE)
 

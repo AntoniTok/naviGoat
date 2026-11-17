@@ -486,6 +486,10 @@ class Middleman:
             'unsupported_target': 'Following a named contact is not available yet.',
             'command_invalid': 'The following command was invalid. Following stopped.',
             'disabled': 'Stopped following.',
+            'transform_unavailable': 'The navigation position is unavailable. Following stopped.',
+            'navigation_unavailable': 'Navigation is not available. Following stopped.',
+            'navigation_failed': 'Navigation failed. Following stopped.',
+            'navigation_cancel_failed': "I couldn't confirm navigation stopped. Please stop the robot.",
         }
         if not isinstance(payload, dict):
             return None

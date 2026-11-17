@@ -1,298 +1,229 @@
-# Person-following prototype and camera test
+# Person following
 
-The following logic and dummy demo use only the Python standard library (Python
-3.9 or newer). A separate ROS runner can consume Enid's live tracks on the Jetson
-and print hypothetical velocity commands. It receives middleman mode commands
-and publishes following status, but sends no drive commands. No robot is needed
-for the camera test.
-
-## Run the demo
-
-From the repository root:
-
-```bash
-python3 -B ros/src/autonomy/person_following/demo.py
-```
-
-Run one scenario at a time with `--scenario following`, `--scenario target-loss`
-or `--scenario camera-timeout`. Use `--scenario nearest-person` to see selection
-and target locking with multiple people. All scenarios run immediately using simulated
-time; no Jetson or camera is needed.
-
-The table shows input position, state, selected track ID, forward velocity
-`v` (m/s), turning velocity `w` (rad/s), and any one-shot event. Positive lateral
-position and positive turning velocity mean left. `enable`/`disable` rows are
-explicit mode commands, followed by the control update at the same time.
-
-- **following:** waiting for confirmation, forward speed adjustment, stopping
-  inside the distance band, left/right steering, and explicit disable.
-- **target-loss:** a 0.5 s slowdown, smooth same-ID resumption, then a 2 s timeout
-  measured since the last actual sighting. Returning after exit does not restart
-  following until explicitly enabled.
-- **camera-timeout:** no new frames for more than 0.5 s causes an immediate zero
-  command and exit, rather than the ordinary missed-detection slowdown.
-- **nearest-person:** selects the nearest confirmed, observed person by horizontal
-  camera range, `hypot(forward, lateral)`, when enabled. A closer newcomer cannot
-  replace that target. Explicit disable and re-enable allow a new selection.
-
-The control loop runs every 0.25 simulated seconds in this demo. Watchdog and
-loss deadlines are acted on at the first update at or after their threshold
-(the stale-input watchdog uses strictly greater than 0.5 s).
-
-These are scripted observations, not simulated robot physics. They demonstrate
-the logic; they do not measure physical following accuracy or stopping distance.
-
-## How the files interact
-
-`demo.py` supplies a `PerceptionFrame` to `FollowingStateMachine.update()` on each
-control tick. On acquisition the state machine selects the nearest confirmed,
-observed track, then retains its ID even if another person comes closer. It
-checks freshness and timing, then calls `VelocityController.compute()` while
-following. Its returned `FollowingOutput` contains state, command, target ID and
-an optional status event. The demo prints that output.
-
-Call `update()` regularly even when no perception result arrives. Use `frame=None`
-for no new result, an empty `people` tuple for a fresh result with no person, and
-`input_healthy=False` for a known camera/depth fault. Frame and control timestamps
-must share one monotonic clock domain.
-
-The controller defaults to a 1.0 m camera-forward distance with a 0.15 m tolerance,
-0.2 m/s maximum forward speed and 0.5 rad/s maximum turning speed. It approaches
-the upper distance-band edge (1.15 m); it does not reverse. At bearings of 30
-degrees or more it requests turning in place. These are initial test parameters.
-
-Same-ID resumption assumes the upstream tracker associated the person correctly.
-Before moving-robot integration, address Enid's stationary-camera tracking
-assumption. Drive-command routing remains future work; the middleman connection
-is implemented below but still needs live ROS verification.
-
-## Live Jetson + camera test
-
-The camera stays stationary and level; you move in its field of view.
+Select the nearest confirmed, observed person when enabled, retain that track
+ID, and generate destinations about one metre behind them. Nav2 handles path
+planning and velocities. This subsystem reuses the team's shared person tracks;
+it does not load YOLO, run a camera driver or publish `cmd_vel`.
 
 ```text
-Femto Bolt → Enid's ROS camera + depth registration
-           → ONE YOLO-World detector + Kalman tracker
-           → /social_perception/tracks (JSON in std_msgs/String)
-           → perception_adapter.py → state_machine.py → velocity_controller.py
-           → ros_camera_test.py prints velocities and positions
-                               ↔ middleman mode commands / following status
+Camera → shared YOLO server → person tracker → /social_perception/tracks
+                                                       ↓
+Lia's middleman → /middleman/mode → person following: select + monitor target
+                                                       ↓ capture-time TF
+                                             one-metre standoff goal
+                                                       ↓
+                                     /person_following/goal_preview
+                                                       ↓ --execute-nav2 only
+                                            NavigateToPose → Nav2 → base
 ```
 
-Enid's eight files under `enid/social_perception/` and `docker_enid/Dockerfile`
-were copied unchanged from `origin/enid/social-perception` at commit `7cd2df1`.
-No unrelated navigation or simulation files were imported. Her original host
-launcher mounts only the `enid` directory and assumes `~/naviGoat`, so use the
-whole-repository camera-test launch below instead.
+Preview is the default. Actual navigation requires `--execute-nav2`. Run one
+following runner at a time. Laptop tests pass; live ROS, Jetson and moving-robot
+behaviour still need validation.
 
-New integration files:
+## Files
 
-- `perception_adapter.py`: validates the existing JSON format and maps capture
-  timestamps to monotonic time while preserving processing delay. Duplicate
-  results cannot refresh the watchdog. Predicted tracks stay unobserved.
-- `ros_camera_test.py`: subscribes with a one-message queue, runs control at
-  20 Hz using a steady timer, logs outputs, exposes an enable/disable service,
-  receives `/middleman/mode`, and publishes `/person_following/status`. It does
-  not load a detector or publish drive velocities.
-- `mode_bridge.py`: validates middleman commands, retains the selected person
-  across repeated follow commands, rejects named contacts, and echoes request IDs
-  in feedback. This module has no ROS dependency and is tested on the laptop.
-- `run_camera_test.sh`: starts Enid's unchanged camera/tracker/dashboard pipeline
-  and the console runner. It starts idle by default for voice/middleman control;
-  pass `--enable-on-start` explicitly for a standalone camera test. It sets
-  `TRACK_MAX_AGE=2.0` to match our loss window.
-  It defaults `DASHBOARD_PORT` to `8766`, leaving `8765` for the voice pipeline's
-  Whisper server. An explicit `DASHBOARD_PORT` environment value is preserved.
-  It temporarily relaxes unset-variable checking while sourcing ROS setup,
-  restores strict checking afterwards, and aborts if setup fails.
-- `docker/Dockerfile.following-test`: adds explicit ROS registration/runner
-  dependencies to Enid's existing `navigoat:people-dev` image.
+| File | Responsibility |
+| --- | --- |
+| `state_machine.py` | Enable/disable, nearest-person selection, target locking, loss and freshness checks |
+| `perception_adapter.py` | Validate shared tracking JSON and preserve capture time and processing latency |
+| `mode_bridge.py` | Interpret middleman commands and correlate status using request IDs |
+| `goal_generator.py` | Transform planar target positions and calculate standoff goals, tolerance and update thresholds |
+| `nav2_goal_client.py` | Asynchronous goal acceptance, preemption, cancellation and timeouts |
+| `ros_nav2_follow.py` | ROS node connecting tracks, TF, mode/status, previews and optional Nav2 actions |
+| `run_nav2_follow.sh` | Launch this node inside the existing team ROS environment |
+| `goal_demo.py` | Laptop demonstration with invented observations and transforms |
+| `tests/` | Offline checks for tracking, commands, geometry, action lifecycle and launcher |
 
-### Prepare the Jetson
+The node is the ROS interface for person following. Its filename mentions Nav2
+because that is how it asks the robot to move. The state machine calculates no
+velocities; physical deceleration belongs to the navigation stack.
 
-Transfer this whole checkout, including the new uncommitted/untracked files, to
-the Jetson. A `git pull` alone will not transfer files that have not been committed
-and pushed. Run the commands below from the repository root **on the Jetson**.
+## Laptop checks
 
-If Enid's working `navigoat:people-dev` image is already there, reuse it and build
-only the small dependency layer:
+Python 3.9 or newer, standard library only. From the repository root:
 
 ```bash
-sudo docker build -f docker/Dockerfile.following-test -t navigoat:following-test .
+python3 -B ros/src/autonomy/person_following/goal_demo.py
+python3 -B ros/src/autonomy/person_following/ros_nav2_follow.py --help
 ```
 
-If `navigoat:people-dev` is absent, Enid's original build chain is:
-
-```bash
-sudo docker build -f docker/Dockerfile.dev -t navigoat:dev .
-sudo docker build -f docker_enid/Dockerfile -t navigoat:people-dev .
-sudo docker build -f docker/Dockerfile.following-test -t navigoat:following-test .
-```
-
-The original image has JetPack/CUDA-specific PyTorch dependencies. Its build and
-GPU compatibility have not been verified on this laptop or on your Jetson; reuse
-a known-working image where available. This test does not need Pete's Ollama/VLM
-extras (`PETE=true`). The first YOLO launch may download its model checkpoint.
-
-### Start the camera test
-
-Connect the camera. Stop any other program/container using it, including a
-previous `navigoat-social` pipeline. Start this single stack:
-
-```bash
-sudo docker run --rm -it --init --name navigoat-following-test \
-  --runtime=nvidia --gpus all --network=host --ipc=host \
-  -e NVIDIA_VISIBLE_DEVICES=all \
-  -e NVIDIA_DRIVER_CAPABILITIES=compute,utility \
-  --device-cgroup-rule='c 189:* rwm' \
-  -v /dev/bus/usb:/dev/bus/usb \
-  -v /run/udev:/run/udev:ro \
-  -v "$PWD:/workspace" \
-  navigoat:following-test \
-  bash /workspace/ros/src/autonomy/person_following/run_camera_test.sh --enable-on-start
-```
-
-This starts the camera driver, depth registration, person detector/tracker,
-Enid's local dashboard, and our console runner. Ctrl+C stops the stack. The
-console runner starts enabled with this explicit flag, waits for a confirmed person, and logs commands
-twice per second plus state events. Wait for model startup before testing.
-
-Typical output:
-
-```text
-state=FOLLOWING target=7 v=0.198m/s w=+0.149rad/s position=(2.00,+0.30)m observed=True ...
-state=TEMPORARILY_LOST ... event=target_missing
-state=IDLE ... event=target_lost
-```
-
-After loss or a fault, use another Jetson terminal to re-enable explicitly:
-
-```bash
-sudo docker exec navigoat-following-test bash -c \
-  'source /opt/ros/jazzy/setup.bash && ros2 service call /person_following/set_enabled std_srvs/srv/SetBool "{data: true}"'
-```
-
-Use `{data: false}` to disable. Standalone sessions publish status with a null
-request ID, so the middleman ignores them. Voice sessions echo the request ID
-from the middleman's command and can update its mode when following ends.
-
-If Enid's pipeline is already running in a compatible ROS environment, start
-**only** the subscriber there, with this full checkout available:
-
-```bash
-source /opt/ros/jazzy/setup.bash
-python3 -B ros/src/autonomy/person_following/ros_camera_test.py --enable-on-start
-```
-
-Do not start the all-in-one launcher as well. If the existing container only
-mounts `enid/`, it needs access to our directory too. The service and subscriber
-must share the pipeline's ROS domain and clock configuration. Live camera stamps
-must use the same ROS system clock as the runner; the adapter rejects future or
-stale capture times rather than guessing a clock offset. Simulation/bag time is
-not configured by this live launcher.
-
-Through our launcher, the dashboard listens on `127.0.0.1:8766` by default. To
-view it from your laptop, forward port `8766` over SSH to your Jetson and open
-`http://localhost:8766`. Whisper can continue using `127.0.0.1:8765`.
-It shows tracking, while following commands appear in the terminal.
-
-### Lia's voice/middleman connection
-
-The following runner now implements both directions of the interface:
-
-| Direction | Topic | Message |
-| --- | --- | --- |
-| Middleman → following | `/middleman/mode` | `std_msgs/String` JSON: `mode`, `target`, `intent`, `stop`, `request_id` |
-| Following → middleman | `/person_following/status` | `std_msgs/String` JSON: `request_id`, `state`, `event`, `target_id` |
-| Middleman → voice | `/pete/response` | Existing spoken-response text |
-
-An empty-target follow command enables nearest-person acquisition. Stop or any
-other mode disables immediately. Repeating a follow request while active keeps
-the selected person. A new command after timeout can acquire again. Named
-contacts are rejected rather than silently selecting someone else.
-
-Each middleman mode decision has a unique `request_id`; following echoes it in
-status messages. Matching terminal target-loss, stale-input, input-fault or
-unsupported-contact events return the middleman to idle and produce a spoken
-explanation. Acquisition/progress events do not end a mode. Reports from older
-sessions, duplicate failures and standalone tests are ignored. `/middleman/done`
-is not used for following, so losing someone never announces "Arrived".
-
-Both the following runner AND the middleman must run the updated code from this
-branch. Older middleman follow commands without a request ID are rejected. The
-extra JSON field is ignored by the navigation consumer. Status is sent on events
-and about twice per second while the runner is alive; the middleman currently
-does not implement a separate watchdog for the runner process dying entirely.
-
-For a typed-command integration test on the Jetson:
-
-1. Start the camera stack using the Docker command above, but **omit**
-   `--enable-on-start`. It should remain IDLE until a mode command arrives.
-2. In another Jetson terminal, launch the middleman inside that same container:
-
-   ```bash
-   sudo docker exec -it navigoat-following-test bash -c \
-     'source /opt/ros/jazzy/setup.bash && ros2 launch /workspace/ros/src/core/launch/middleman.launch.py use_qwen:=false'
-   ```
-
-3. In another terminal, enter the container and source ROS:
-
-   ```bash
-   sudo docker exec -it navigoat-following-test bash
-   source /opt/ros/jazzy/setup.bash
-   ```
-
-   Inject typed speech requests:
-
-   ```bash
-   ros2 topic pub --once /speech/text std_msgs/msg/String "{data: 'pete start following'}"
-   ros2 topic pub --once /speech/text std_msgs/msg/String "{data: 'pete stop following'}"
-   ros2 topic pub --once /speech/text std_msgs/msg/String "{data: 'pete manual mode'}"
-   ```
-
-   Observe `/middleman/mode`, `/person_following/status` or `/pete/response` in a
-   separate terminal using `ros2 topic echo TOPIC`. After acquiring a person,
-   leave the frame for two seconds: both following and the middleman should
-   return to idle, with a target-loss response. No drive commands are sent.
-
-For actual microphone testing, use Lia's ROS voice launcher,
-`ros/src/interaction/voice/start_voice_ros.sh`, instead of starting a second
-middleman. Her voice launch already includes one. Ensure its container mounts
-this updated checkout (its script defaults to `~/naviGoat`) and uses the same
-ROS domain as the following container. Her non-ROS `start_voice.sh` only runs the
-standalone listener and does not provide these ROS commands.
-
-### Camera-test checks and current limits
-
-1. Stand alone about 2 m in front of the camera: acquire one ID, with positive
-   forward speed. Move towards 1 m: forward speed should reach zero in the band.
-2. Move to the camera's left/right: positive/negative angular commands. At a
-   large sideways angle, the forward command should be zero.
-3. Leave the frame: speed ramps down. Return with the same track before timeout:
-   following resumes. Stay absent for 2 s: following exits; re-enable to restart.
-4. Disconnect the camera: the runner's input watchdog requests zero and exits
-   once results are stale. Some driver failures may terminate the entire stack.
-5. Compare reported positions with measured camera-to-person distances and note
-   the reported processing latency. These are observations to collect on hardware,
-   not results established by the laptop tests.
-
-Enid publishes **confirmed tracks with valid depth**, not every YOLO detection.
-Only those tracks are candidates for nearest-person selection. Tentative extra
-people are not visible to this subscriber, and an
-invalid-depth detection cannot be distinguished from a missed detection. That
-case follows the loss ramp; an explicit fault or malformed position stops
-immediately. A separate depth-health signal is needed to distinguish these later.
-Restarting the perception process also resets its IDs: stop/re-enable the runner
-when restarting perception rather than trusting a reused number.
-
-This wrapper changes neither Enid's association algorithm nor her camera
-assumptions. The live ROS runner, Docker build and physical camera test have not
-been run on this laptop, which has no ROS, Docker or camera environment. Laptop
-tests cover the JSON-to-following logic with dummy data.
-
-## Run tests
+Run the tests from the subsystem directory:
 
 ```bash
 cd ros/src/autonomy/person_following
-python3 -B -m unittest discover -s tests -v
+python3 -B -m unittest discover -s tests
 ```
+
+The demo shows selection, target locking, goal updates, holding position,
+temporary loss, resumption and eventual exit. It does not simulate robot physics.
+ROS and hardware are not required for these checks.
+
+## Start shared perception on the Jetson
+
+Keep the camera stationary and level for the first test. Use the team's existing
+image/container with `PETE=true` and `SOCIAL=true` support (`VOICE=true` for a
+microphone). There is no separate following Docker image to build.
+
+If Pete already runs the camera, shared detector, tracker and middleman with the
+correct track lifetime, keep it running. Otherwise, from the repository root on
+the Jetson, start the team's host launcher:
+
+```bash
+bash ros/src/core/start_pete.sh people:=true people_max_age:=2.0 use_qwen:=false
+```
+
+It creates `navigoat-dev`, mounts the checkout at `/workspace`, and starts Pete's
+shared stack. `use_qwen:=false` disables the middleman's optional interpretation
+for typed-command testing; scene description still starts its model. Wait for
+the shared YOLO server and tracker to become ready. For microphone testing add
+`voice:=true`; that launch already includes the middleman.
+
+If starting within an existing compatible container instead, source ROS and run:
+
+```bash
+ros2 launch /workspace/ros/src/core/launch/pete.launch.py \
+  people:=true people_max_age:=2.0 use_qwen:=false
+```
+
+Choose one launch path. Set `people_max_age` to match the following loss window
+(default two seconds). Pete retains its one-second default for other users.
+
+| Shared component | Interface |
+| --- | --- |
+| YOLO server | HTTP `127.0.0.1:8767`; the tracker uses `--yolo-url` |
+| Person tracker | `/social_perception/tracks`, JSON in `std_msgs/String` |
+| Dashboard | Port 8766 by default |
+| Voice/middleman | `/middleman/mode` and `/pete/response` |
+
+Object perception and the person tracker request detections from one server.
+Following subscribes to the resulting tracks, without another model or HTTP
+client. It uses the original tracks rather than `/people` so that actual
+observations, predictions and capture-time freshness remain distinguishable.
+
+## Preview with a camera only
+
+In another Jetson terminal:
+
+```bash
+sudo docker exec -it navigoat-dev \
+  bash /workspace/ros/src/autonomy/person_following/run_nav2_follow.sh \
+  --global-frame camera_link --base-frame camera_link
+```
+
+This treats the camera as the hypothetical robot origin and requires no Nav2
+action server. The runner starts idle; use the middleman commands below, or add
+`--enable-on-start` for a standalone test. Preview cannot command movement.
+
+With localisation and robot TF running, omit the frame overrides to preview in
+`map` using the actual `base_link` position. Target transforms use the image's
+capture timestamp; missing historical TF causes an exit. The latest robot pose
+must also be fresh. Frames tilted more than about three degrees are rejected
+because the tracker supplies no vertical target coordinate.
+
+Processes must share a ROS domain and source-clock configuration. The live
+adapter preserves capture latency and rejects stale/future timestamps; bag or
+simulation clock setup is not supplied by this launcher.
+
+## Lia's voice/middleman connection
+
+In another terminal, enter the running container and source ROS:
+
+```bash
+sudo docker exec -it navigoat-dev bash
+source /opt/ros/jazzy/setup.bash
+```
+
+Send each request separately:
+
+```bash
+ros2 topic pub --once /speech/text std_msgs/msg/String "{data: 'pete start following'}"
+ros2 topic pub --once /speech/text std_msgs/msg/String "{data: 'pete stop following'}"
+ros2 topic pub --once /speech/text std_msgs/msg/String "{data: 'pete manual mode'}"
+```
+
+Inspect the outputs from another ROS terminal:
+
+```bash
+ros2 topic echo /person_following/status
+ros2 topic echo /person_following/goal_preview
+ros2 topic echo /pete/response
+ros2 topic hz /social_perception/tracks
+```
+
+| Interface | Type | Purpose |
+| --- | --- | --- |
+| `/middleman/mode` | `std_msgs/String` JSON | Receive `{mode, target, intent, stop, request_id}` |
+| `/person_following/status` | `std_msgs/String` JSON | Publish `{request_id, state, event, target_id, navigation, navigation_pending}` |
+| `/person_following/goal_preview` | `geometry_msgs/PoseStamped` | Show generated destinations; this topic does not move the robot |
+| `/person_following/set_enabled` | `std_srvs/SetBool` service | Manual enable/disable for tests |
+| `/navigate_to_pose` | `nav2_msgs/action/NavigateToPose` | Optional navigation goals and cancellation |
+
+An empty-target follow command enables acquisition. A named contact is rejected
+until identity recognition exists. Stop or a different mode disables following.
+Request IDs prevent old/duplicate failures from ending a newer session; both
+middleman and following need the updated code. Following does not publish
+`/middleman/done`: reaching an intermediate goal does not finish following or say
+"Arrived". Manual sessions do not acquire ownership of a voice request.
+
+## Behaviour and timing
+
+- Select the nearest confirmed, observed ID by horizontal camera range once;
+  a closer newcomer cannot replace it. Predicted tracks cannot refresh sightings.
+- Generate a goal one metre from the target, on the robot's side and facing it.
+  This is radial distance from `base_link`, not front-edge clearance. Within
+  1.15 m, cancel navigation and hold instead of requesting retreat.
+- Check state and freshness at 20 Hz. Send goal updates at most 2 Hz, with
+  0.15 m position / 0.2 rad heading thresholds. Status is sent on events and
+  approximately twice per second.
+- Missing target: cancel navigation immediately and retain its ID briefly.
+  The same ID can resume within two seconds of the last actual sighting.
+  After two seconds, exit and report `target_lost` to the middleman. An explicit
+  new follow request is then required.
+- No fresh tracking input for more than 0.5 s, invalid input, unavailable TF or
+  navigation failures: cancel and exit. Deadlines take effect on control ticks.
+- Updated goals preempt old ones. Stop invalidates pending requests and cancels
+  late acceptances. A new session waits for old cancellation to finish.
+  Acknowledgement and terminal action results are checked separately; cancellation
+  failure is reported rather than treated as confirmation that motion stopped.
+- Ctrl+C/SIGTERM requests cancellation and keeps processing ROS responses for up
+  to the action timeout. An abrupt process kill or network loss cannot guarantee
+  stopping; the navigation/base watchdog remains necessary.
+
+The old direct-velocity slowdown is not part of this path. Nav2 owns actual speed
+limits, deceleration, reversing, recoveries and goal tolerances. Its current XY
+goal tolerance is 0.25 m, larger than this following band; tune these together
+with the navigation team before judging physical following accuracy.
+
+## Navigation execution and remaining validation
+
+Pete's perception launch does not start Nav2. Actual execution also requires the
+team's Nav2/localisation bringup, a working action server and capture-time camera
+to navigation-frame TF. Useful checks in that ROS environment:
+
+```bash
+ros2 action info /navigate_to_pose
+ros2 run tf2_ros tf2_echo map base_link
+ros2 run tf2_ros tf2_echo base_link camera_link
+```
+
+After controlled/simulated validation and addressing the tracking limitation
+below, restart the one following runner with action execution enabled:
+
+```bash
+sudo docker exec -it navigoat-dev \
+  bash /workspace/ros/src/autonomy/person_following/run_nav2_follow.sh --execute-nav2
+```
+
+This can move the robot. Goals default to `map`; frame names, action name,
+distance, rates and timeouts are configurable with `--help`.
+
+The upstream tracker associates camera-relative positions under a stationary,
+level-camera assumption. Transforming its selected output into `map` does not
+repair ID association when the robot moves. Stationary-camera preview is the
+first milestone; ego-motion compensation, crossing/occlusion checks, live ROS
+integration and physical stopping tests remain before dependable robot following.
+
+Superseded velocity demos and standalone perception/Docker copies have been
+removed from the active tree. A local pre-cleanup archive is ignored by Git;
+previously committed versions also remain available in Git history.

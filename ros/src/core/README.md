@@ -33,7 +33,8 @@ The other parameter is `use_qwen` (default `false`): let Qwen match a need to a 
 Following commands now include a unique `request_id`. The following runner
 echoes it on `/person_following/status`. A matching terminal event in state
 `IDLE` (`target_lost`, `input_stale`, `input_fault`, `unsupported_target`,
-`command_invalid`, or `disabled`) ends that follow request and publishes its
+`command_invalid`, `disabled`, `transform_unavailable`, `navigation_unavailable`,
+`navigation_failed`, or `navigation_cancel_failed`) ends that follow request and publishes its
 explanation on `/pete/response`. Progress, old-session messages and duplicates
 are ignored; following failures do not use the arrival handler. Both nodes need
 the updated code. See [the following integration test](../autonomy/person_following/README.md#lias-voicemiddleman-connection)
@@ -91,6 +92,7 @@ ros2 launch /workspace/ros/src/core/launch/pete.launch.py
 | `search_time` | `5.0` | seconds object detection looks for a goal |
 | `use_qwen` | `true` | as above. Here it is on by default: Ollama runs in the same container for scene description, so the middleman shares that loaded Qwen |
 | `people` | `false` | `true` also starts the people tracker (`femto_person_tracker`, publishes `/social_perception/tracks`) and its dashboard, from [social_perception](../autonomy/perception/social_perception). They use the camera Pete already runs, and the tracker uses perception's [YOLO server](../autonomy/perception/yolo_server.py) instead of loading its own model. Needs the `SOCIAL=true` image |
+| `people_max_age` | `1.0` | seconds the tracker retains a missed track; use `2.0` with person following to match its two-second loss window |
 | `people_port` | `8766` | the dashboard's port. Not 8765: that is Whisper's |
 | `voice` | `false` | `true` also starts the voice node. It needs the `VOICE=true` image and the host's sound socket (see `start_voice_ros.sh`); the voice launch file starts the middleman itself, so it is never started twice |
 | `whisper_url`, `listen`, `device` | as in the voice launch file | passed on to the voice node |
@@ -109,8 +111,9 @@ Tested: the rules, with unit tests (they cover the rules, the matching of mis-he
 
 Not tested:
 - The object search against Flavio's real `object_detection.py` (YOLO). It needs the Jetson's memory sorted out first.
-- Person following consumes `/middleman/mode` through its camera-test runner and
-  reports failures on `/person_following/status`; the runner still prints velocities
-  rather than driving. Other modes' arrival reporting uses `/middleman/done`.
+- Person following consumes `/middleman/mode` and reports failures on
+  `/person_following/status`. It has an offline goal demo and a ROS runner
+  (preview by default; Nav2 actions require `--execute-nav2`). Other modes'
+  arrival reporting uses `/middleman/done`.
 - `found:<object>` is not spoken, and the object's position (`/object_mapping`) goes nowhere.
 - The object and place lists in `catalog.py` are a copy of the ones in `autonomy/perception/object_detection.py` (88 words and 84 aliases). They have to be kept equal by hand until one imports the other.

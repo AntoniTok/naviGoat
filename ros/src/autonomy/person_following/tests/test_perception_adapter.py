@@ -1,4 +1,4 @@
-"""Tracking JSON and complete adapter-to-controller checks without ROS."""
+"""Tracking JSON and adapter-to-state-machine checks without ROS."""
 
 import json
 import math
@@ -6,7 +6,6 @@ import unittest
 
 from perception_adapter import COORDINATE_CONVENTION, PerceptionAdapter, PerceptionError
 from state_machine import FollowingState, FollowingStateMachine
-from velocity_controller import VelocityCommand
 
 
 def payload(stamp=1000.0, tracks=None):
@@ -29,6 +28,7 @@ class PerceptionAdapterTests(unittest.TestCase):
     def test_actual_publisher_schema_and_clock_mapping(self):
         result = self.parse(payload())
         self.assertAlmostEqual(result.timestamp_s, 9.85)
+        self.assertEqual(result.source_timestamp_s, 1000.0)
         person = result.people[0]
         self.assertEqual(person.track_id, 7)
         self.assertEqual((person.forward_m, person.lateral_m), (2.0, 0.3))
@@ -141,14 +141,16 @@ class ConnectedPipelineTests(unittest.TestCase):
 
     def test_real_schema_flows_through_acquisition_loss_and_timeout(self):
         for elapsed in (0.0, 0.25, 0.5):
-            moving = self.send(elapsed)
-        self.assertGreater(moving.command.linear_mps, 0)
+            following = self.send(elapsed)
+        self.assertEqual(following.state, FollowingState.FOLLOWING)
+        self.assertEqual(following.target_id, 7)
         lost = self.send(0.75, predicted=True)
         self.assertEqual(lost.state, FollowingState.TEMPORARILY_LOST)
-        half = self.send(1.0, predicted=True)
-        self.assertAlmostEqual(half.command.linear_mps, moving.command.linear_mps / 2)
-        stopped = self.send(1.25, empty=True)
-        self.assertEqual(stopped.command, VelocityCommand())
+        still_missing = self.send(1.0, predicted=True)
+        self.assertEqual(still_missing.state, FollowingState.TEMPORARILY_LOST)
+        self.assertEqual(still_missing.target_id, 7)
+        empty = self.send(1.25, empty=True)
+        self.assertEqual(empty.state, FollowingState.TEMPORARILY_LOST)
         for elapsed in (1.5, 1.75, 2.0):
             self.send(elapsed, empty=True)
         timeout = self.send(2.5, empty=True)
@@ -163,7 +165,7 @@ class ConnectedPipelineTests(unittest.TestCase):
         self.assertEqual(result.state, FollowingState.TEMPORARILY_LOST)
         result = self.machine.update(11.1)
         self.assertEqual(result.event, "input_stale")
-        self.assertEqual(result.command, VelocityCommand())
+        self.assertEqual(result.state, FollowingState.IDLE)
 
 
 if __name__ == "__main__":

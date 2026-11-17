@@ -3,8 +3,9 @@
 Call enable() explicitly, then update() regularly even when no frames arrive.
 Pass a PerceptionFrame for each NEW perception result; an empty people tuple
 means a working camera saw nobody. frame=None means no new result has arrived.
-All timestamps must use the same monotonic clock, in seconds. A future ROS
-adapter must convert sensor timestamps into this clock domain.
+All lifecycle timestamps use the same monotonic clock, in seconds. The perception
+adapter converts sensor timestamps into this domain and keeps source capture
+time separately for the ROS node's transform lookups.
 
 Predicted tracks do not count as sightings. ID continuity is trusted only for
 the short loss window; callers must provide reliable association. This module
@@ -16,8 +17,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 import math
-
-from velocity_controller import VelocityCommand, VelocityController
 
 
 class FollowingState(str, Enum):
@@ -40,37 +39,30 @@ class PersonObservation:
 class PerceptionFrame:
     timestamp_s: float
     people: tuple[PersonObservation, ...] = ()
+    source_timestamp_s: float | None = None  # original ROS capture time for exact-time TF
 
 
 @dataclass(frozen=True)
 class FollowingConfig:
-    loss_ramp_s: float = 0.5
     loss_timeout_s: float = 2.0
     input_timeout_s: float = 0.5
-    linear_acceleration_mps2: float = 0.4
-    angular_acceleration_rps2: float = 1.0
 
     def __post_init__(self):
         for name, value in vars(self).items():
             if not math.isfinite(value) or value <= 0:
                 raise ValueError(f"{name} must be finite and positive")
-        if self.loss_ramp_s >= self.loss_timeout_s:
-            raise ValueError("Loss ramp must finish before the loss timeout")
 
 
 @dataclass(frozen=True)
 class FollowingOutput:
     state: FollowingState
-    command: VelocityCommand
     target_id: int | None
-    # One-shot machine-readable event, for a future adapter to publish to Lia.
+    # One-shot machine-readable event published through the mode bridge.
     event: str | None = None
 
 
 class FollowingStateMachine:
-    def __init__(self, controller: VelocityController | None = None,
-                 config: FollowingConfig | None = None):
-        self.controller = controller if controller is not None else VelocityController()
+    def __init__(self, config: FollowingConfig | None = None):
         self.config = config if config is not None else FollowingConfig()
         self._reset()
         self._last_tick = None
@@ -78,15 +70,11 @@ class FollowingStateMachine:
     def _reset(self):
         self.state = FollowingState.IDLE
         self.target_id = None
-        self.command = VelocityCommand()
         self._last_frame = None
         self._last_seen = None
-        self._target = None
-        self._loss_started = None
-        self._loss_command = VelocityCommand()
 
     def _output(self, event=None):
-        return FollowingOutput(self.state, self.command, self.target_id, event)
+        return FollowingOutput(self.state, self.target_id, event)
 
     def _stop(self, reason):
         self._reset()
@@ -102,22 +90,22 @@ class FollowingStateMachine:
         return self._output("enabled")
 
     def disable(self) -> FollowingOutput:
-        """Immediately command zero (also suitable for an external stop request)."""
+        """End the session; the ROS adapter must cancel its navigation goal."""
         return self._stop("disabled")
 
     def update(self, now_s: float, frame: PerceptionFrame | None = None,
                *, input_healthy: bool = True) -> FollowingOutput:
-        """Advance one control tick and return a command plus optional event.
+        """Advance one tracking tick and return state, target and optional event.
 
         Camera/depth failures should set input_healthy=False. Stale input also
-        immediately stops and exits. Ordinary missed detections instead use the
-        loss ramp. The caller remains responsible for transmitting each output.
+        immediately exits. Missed detections retain the selected ID briefly for
+        reacquisition. The adapter cancels navigation whenever not FOLLOWING;
+        this module neither calculates velocities nor controls deceleration.
         """
         if (not math.isfinite(now_s) or
                 (self._last_tick is not None and now_s < self._last_tick)):
             self._stop("input_fault")
             raise ValueError("Control time must be finite and monotonic")
-        dt = 0.0 if self._last_tick is None else now_s - self._last_tick
         self._last_tick = now_s
         if self.state == FollowingState.IDLE:
             return self._output()
@@ -164,44 +152,12 @@ class FollowingStateMachine:
                         event = "target_reacquired"
                     self.state = FollowingState.FOLLOWING
                     self._last_seen = frame.timestamp_s
-                    self._target = target
-                    self._loss_started = None
                 elif self.state == FollowingState.FOLLOWING:
                     self.state = FollowingState.TEMPORARILY_LOST
-                    self._loss_started = now_s
-                    self._loss_command = self.command
                     event = "target_missing"
 
         if (self._last_frame is not None and
                 now_s - self._last_frame > self.config.input_timeout_s):
             return self._stop("input_stale")
 
-        if self.state == FollowingState.FOLLOWING:
-            desired = self.controller.compute(self._target.forward_m, self._target.lateral_m)
-            self.command = self._smooth_command(desired, dt)
-        elif self.state == FollowingState.TEMPORARILY_LOST:
-            # Always scale the command captured at loss onset, rather than
-            # repeatedly scaling a changing value (which would depend on rate).
-            fraction = max(0.0, 1.0 - (now_s - self._loss_started) / self.config.loss_ramp_s)
-            self.command = VelocityCommand(
-                self._loss_command.linear_mps * fraction,
-                self._loss_command.angular_rps * fraction,
-            )
-        else:
-            self.command = VelocityCommand()
         return self._output(event)
-
-    def _smooth_command(self, desired, dt):
-        def approach(current, requested, acceleration):
-            # A zero forward request (too close / turn in place) stops promptly.
-            if requested == 0:
-                return 0.0
-            limit = acceleration * dt
-            return current + max(-limit, min(limit, requested - current))
-
-        return VelocityCommand(
-            approach(self.command.linear_mps, desired.linear_mps,
-                     self.config.linear_acceleration_mps2),
-            approach(self.command.angular_rps, desired.angular_rps,
-                     self.config.angular_acceleration_rps2),
-        )
