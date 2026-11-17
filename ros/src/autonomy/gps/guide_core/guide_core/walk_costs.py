@@ -42,9 +42,9 @@ Cost model (all values in metres):
   only stop on a narrow island as precisely as its localisation allows.
 """
 
+from dataclasses import dataclass, fields
 import enum
 import math
-from dataclasses import dataclass, fields
 
 FORBIDDEN_TYPES = frozenset({'steps', 'corridor'})
 WALKWAY_TYPES = frozenset({'footway', 'pedestrian', 'path'})
@@ -57,7 +57,8 @@ MINOR_ROADS = frozenset({'residential', 'unclassified', 'service', 'living_stree
 # UK crossing_ref values for crossings with traffic lights.
 SIGNALLED_CROSSING_REFS = frozenset({'pelican', 'puffin', 'toucan', 'pegasus'})
 # crossing=* values that mean "no traffic lights".
-UNSIGNALLED_CROSSING_VALUES = frozenset({'unmarked', 'uncontrolled', 'marked', 'zebra', 'informal'})
+UNSIGNALLED_CROSSING_VALUES = frozenset(
+    {'unmarked', 'uncontrolled', 'marked', 'zebra', 'informal'})
 
 
 class WalkwayClass(enum.Enum):

@@ -1,8 +1,7 @@
 """Tests for the pedestrian-island part of guide_core.walk_costs."""
 
-import pytest
-
 from guide_core.walk_costs import CostConfig, edge_cost, is_island_tagged
+import pytest
 
 WALKWAY = {'highway': 'footway'}
 CROSSING_WAY = {'highway': 'footway', 'footway': 'crossing'}

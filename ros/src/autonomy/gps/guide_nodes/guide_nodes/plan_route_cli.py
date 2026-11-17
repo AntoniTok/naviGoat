@@ -14,18 +14,17 @@ import math
 import os
 import sys
 
-import rclpy
-import yaml
-from rclpy.node import Node
-from rclpy.utilities import remove_ros_args
-
-from guide_interfaces.msg import RouteCrossing
-from guide_interfaces.srv import PlanRoute, SetRoute
-
-from guide_core.crossings import (RouteCrossing as CoreCrossing, crossings_from_dict,
-                                  crossings_to_dicts, prepare_crossings)
+from guide_core.crossings import (
+    crossings_from_dict, crossings_to_dicts, prepare_crossings, RouteCrossing as CoreCrossing,
+)
 from guide_core.route import InvalidRouteError, Route, route_from_dict
 from guide_core.walk_costs import CrossingType
+from guide_interfaces.msg import RouteCrossing
+from guide_interfaces.srv import PlanRoute, SetRoute
+import rclpy
+from rclpy.node import Node
+from rclpy.utilities import remove_ros_args
+import yaml
 
 # RouteCrossing.msg's uint8 constants -> readable names.
 TYPE_NAMES = {

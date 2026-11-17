@@ -2,9 +2,8 @@
 
 import math
 
-import pytest
-
 from guide_core.polyline import point_segment_distance, simplify_polyline
+import pytest
 
 
 # --- point_segment_distance --------------------------------------------------

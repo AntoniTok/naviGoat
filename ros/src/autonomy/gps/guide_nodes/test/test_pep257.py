@@ -19,5 +19,9 @@ import pytest
 @pytest.mark.linter
 @pytest.mark.pep257
 def test_pep257():
-    rc = main(argv=['.', 'test'])
+    # Ignored on top of ament's defaults (decided in Step 10.6):
+    # D213: the summary goes on the first line, after the opening quotes, not on the second;
+    # D406, D407, D413: numpy-style section rules (dashed underlines); we write Google-style
+    # sections ("Returns:", "Args:").
+    rc = main(argv=['.', 'test', '--add-ignore', 'D213', 'D406', 'D407', 'D413'])
     assert rc == 0, 'Found code style errors / warnings'

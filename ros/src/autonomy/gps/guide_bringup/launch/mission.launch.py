@@ -1,9 +1,10 @@
-"""Full mission in simulation: one action goal takes the robot to a destination.
+r"""Full mission in simulation: one action goal takes the robot to a destination.
 
 Starts: sim robot, localizer, route follower (no route; routes come from the
 mission manager), goal sender, route planner (cached OSM graph), geocoder
-(names not in the curated list: Nominatim online + on-disk cache) and mission
-manager (curated destinations); optionally RViz and the run evaluator.
+(names not in the curated list: Nominatim online + on-disk cache), mission
+manager (curated destinations) and the GPS bridge (the team's topics in and
+out, Step 10); optionally RViz and the run evaluator.
 
 Usage:
   ros2 launch guide_bringup mission.launch.py
@@ -14,13 +15,22 @@ Usage:
   ros2 launch guide_bringup mission.launch.py sensors:=urban_canyon noise_seed:=2
       evaluate:=true auto_go:=true            (all on one line)
 
-Then, in another terminal:
+Then, in another terminal, as the team's middleman and handle would (Step 10):
+  ros2 topic pub -w 1 --once /middleman/mode std_msgs/msg/String
+      "data: '{\"mode\": \"gps\", \"target\": \"south ken\"}'"   (one line)
+  ros2 topic pub -w 1 --once /gps/go std_msgs/msg/Empty      # the user's go
+  ros2 topic echo /pete/response                             # what Pete says
+Or with our own interfaces directly:
   ros2 action send_goal --feedback /guide/navigate_to
       guide_interfaces/action/NavigateTo "{destination: 'south ken'}"   (one line)
   ros2 service call /guide/user_go std_srvs/srv/Trigger      # the user's go
   ros2 service call /guide/user_pause std_srvs/srv/Trigger   # the user's pause
 
 Ctrl+C stops all nodes (the goal sender cancels any active goal first).
+
+This is our development launch (sensor presets, evaluator); guide.launch.py is
+the one for the team. Both read config/gps.yaml (origin, topic names, frames),
+or another file with params_file:=...
 """
 
 from launch import LaunchDescription
@@ -54,7 +64,7 @@ SENSOR_PRESETS = {
 }
 
 
-def make_sim(context, share, origin, as_float):
+def make_sim(context, share, params_file, as_float):
     """Build the sim_robot node for the chosen sensors preset.
 
     OpaqueFunction calls this at launch time with the launch context, so
@@ -70,11 +80,10 @@ def make_sim(context, share, origin, as_float):
              if preset['gps_zones'] else 'none')
     return [Node(
         package='guide_sim', executable='sim_robot', output='screen',
-        parameters=[{
+        parameters=[params_file, {
             'start_x': as_float('start_x'),
             'start_y': as_float('start_y'),
             'start_yaw_deg': as_float('start_yaw_deg'),
-            **origin,
             'noise_seed': ParameterValue(LaunchConfiguration('noise_seed'), value_type=int),
             'gps_profile': preset['gps_profile'],
             'gps_zones_file': zones,
@@ -104,12 +113,11 @@ def generate_launch_description():
                               description='Sim robot start, metres north of the origin'),
         DeclareLaunchArgument('start_yaw_deg', default_value='-82.0',
                               description='Sim robot start heading, degrees (0 = east)'),
-        # The ENU origin. Given ONCE here and passed to every node that converts
-        # between lat/lon and metres, so they cannot disagree.
-        DeclareLaunchArgument('origin_lat', default_value='51.4988',
-                              description='Latitude of the enu frame origin (degrees)'),
-        DeclareLaunchArgument('origin_lon', default_value='-0.1749',
-                              description='Longitude of the enu frame origin (degrees)'),
+        # The parameter file (Step 10): the enu origin, topic names and frames,
+        # given ONCE there and read by every node, so they cannot disagree.
+        DeclareLaunchArgument(
+            'params_file', default_value=PathJoinSubstitution([share, 'config', 'gps.yaml']),
+            description='Parameter file: origin, topic names, frames, Nav2 action'),
         DeclareLaunchArgument(
             'graph_file',
             default_value=PathJoinSubstitution([share, 'osm', 'south_ken_walk.graphml']),
@@ -145,29 +153,31 @@ def generate_launch_description():
     def as_float(name):
         return ParameterValue(LaunchConfiguration(name), value_type=float)
 
-    origin = {'origin_lat': as_float('origin_lat'), 'origin_lon': as_float('origin_lon')}
+    params_file = LaunchConfiguration('params_file')
 
     # Each Node action starts one executable (the same as 'ros2 run package executable').
     # output='screen' shows its log lines in this terminal, prefixed with the
     # process name, e.g. [mission_manager-6]. parameters=[{...}] is the launch-file
-    # equivalent of --ros-args -p name:=value.
+    # equivalent of --ros-args -p name:=value; a file name in the list (params_file)
+    # loads that parameter file first, and the dicts after it win.
     # The simulator depends on the sensors preset, so it is built at launch time.
-    sim = OpaqueFunction(function=make_sim, args=[share, origin, as_float])
+    sim = OpaqueFunction(function=make_sim, args=[share, params_file, as_float])
     localizer = Node(package='guide_nodes', executable='localizer', output='screen',
-                     parameters=[origin])
+                     parameters=[params_file])
     # No route_file: the follower waits for routes on guide/set_route.
     route_follower = Node(package='guide_nodes', executable='route_follower',
-                          output='screen')
-    goal_sender = Node(package='guide_nodes', executable='goal_sender', output='screen')
+                          output='screen', parameters=[params_file])
+    goal_sender = Node(package='guide_nodes', executable='goal_sender', output='screen',
+                       parameters=[params_file])
     route_planner = Node(
         package='guide_nodes', executable='route_planner', output='screen',
-        parameters=[{'graph_file': LaunchConfiguration('graph_file'), **origin}])
+        parameters=[params_file, {'graph_file': LaunchConfiguration('graph_file')}])
     # The geocoder reads only the small .meta.yaml next to graph_file (the area
     # to search in). ParameterValue(..., value_type=bool) turns 'true'/'false'
     # into a real bool, as the node declares online_enabled as a bool.
     geocoder = Node(
         package='guide_nodes', executable='geocoder', output='screen',
-        parameters=[{
+        parameters=[params_file, {
             'graph_file': LaunchConfiguration('graph_file'),
             'cache_file': LaunchConfiguration('geocode_cache_file'),
             'online_enabled': ParameterValue(LaunchConfiguration('online_lookup'),
@@ -175,8 +185,12 @@ def generate_launch_description():
         }])
     mission_manager = Node(
         package='guide_nodes', executable='mission_manager', output='screen',
-        parameters=[{'destinations_file': LaunchConfiguration('destinations_file'),
-                     **origin}])
+        parameters=[params_file,
+                    {'destinations_file': LaunchConfiguration('destinations_file')}])
+    # The GPS bridge: the team's topics (/middleman/mode, /gps/go, ...) in and
+    # out. Its topic names are in the parameter file.
+    gps_bridge = Node(package='guide_nodes', executable='gps_bridge', output='screen',
+                      parameters=[params_file])
 
     # Optional RViz with the planner's configuration (OSM graph, planned route).
     # condition=IfCondition(...) starts the node only if the argument is 'true'.
@@ -189,8 +203,8 @@ def generate_launch_description():
     # simulator's ground truth and prints a summary when the trip ends.
     evaluator = Node(
         package='guide_sim', executable='run_evaluator', output='screen',
-        parameters=[{'auto_go': ParameterValue(LaunchConfiguration('auto_go'),
-                                               value_type=bool)}],
+        parameters=[params_file,
+                    {'auto_go': ParameterValue(LaunchConfiguration('auto_go'), value_type=bool)}],
         condition=IfCondition(LaunchConfiguration('evaluate')))
 
     return LaunchDescription([
@@ -202,6 +216,7 @@ def generate_launch_description():
         route_planner,
         geocoder,
         mission_manager,
+        gps_bridge,
         rviz,
         evaluator,
     ])

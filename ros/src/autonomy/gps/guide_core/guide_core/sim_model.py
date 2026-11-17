@@ -3,8 +3,8 @@
 Stands in for both the real robot and Nav2: given a goal, it turns towards it
 and drives there in a straight line. No obstacles, no noise (yet).
 """
-import math
 from dataclasses import dataclass
+import math
 
 from guide_core.angles import wrap_angle
 
@@ -23,7 +23,8 @@ class RobotState:
 class SimRobot:
     """Unicycle-model robot with a single goal at a time."""
 
-    def __init__(self, max_speed=1.0, max_turn_rate=1.0, goal_tolerance=0.3, slowdown_distance=2.0):
+    def __init__(self, max_speed=1.0, max_turn_rate=1.0, goal_tolerance=0.3,
+                 slowdown_distance=2.0):
         self.max_speed = max_speed                  # m/s (about walking pace)
         self.max_turn_rate = max_turn_rate          # rad/s
         self.goal_tolerance = goal_tolerance        # metres; closer than this = arrived

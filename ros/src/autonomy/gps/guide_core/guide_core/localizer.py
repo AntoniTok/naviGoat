@@ -8,8 +8,8 @@ y = north. This holds in the simulator. On the real robot, SLAM's ``map``
 frame has a different origin and rotation; aligning the two is Step 8.
 """
 
-import math
 from dataclasses import dataclass
+import math
 from typing import Sequence
 
 from guide_core.geo import latlon_to_enu

@@ -34,6 +34,7 @@ setup(
             'plan_route = guide_nodes.plan_route_cli:main',
             'mission_manager = guide_nodes.mission_manager_node:main',
             'geocoder = guide_nodes.geocoder_node:main',
+            'gps_bridge = guide_nodes.gps_bridge_node:main',
         ],
     },
 )

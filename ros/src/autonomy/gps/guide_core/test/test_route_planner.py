@@ -2,13 +2,12 @@
 
 import math
 
-import networkx as nx
-import pytest
-
 from guide_core.geo import enu_to_latlon
 from guide_core.route import Route
 from guide_core.route_planner import PlannedRoute, PlannerConfig, PlanningError, RoutePlanner
 from guide_core.walk_costs import CostConfig, CrossingType
+import networkx as nx
+import pytest
 
 ORIGIN = (51.4988, -0.1749)
 FOOTWAY = {'highway': 'footway'}
@@ -42,7 +41,7 @@ def plan(graph, start, goal, config=None):
 
 
 def road_graph():
-    """A major road with a pavement on each side.
+    """Return a major road with a pavement on each side.
 
     Unsignalled crossing at x=0 (C0), signalled crossing at x=100 (C2),
     steps at x=50 (forbidden). Choices from N0 to S0:
@@ -68,8 +67,10 @@ def road_graph():
 
 
 def shared_space_graph(crossing_tags):
-    """Exhibition Road in miniature: a straight pedestrian line A-M-B with a
-    crossing node M halfway, and a parallel road R1-R2 joined to A and B.
+    """Return Exhibition Road in miniature.
+
+    A straight pedestrian line A-M-B with a crossing node M halfway, and a
+    parallel road R1-R2 joined to A and B.
 
     Straight: 100 m + crossing penalty. Detour via the road, with the
     minor road factor set to 3 (SHARED_SPACE_CONFIG; the default is 10):

@@ -1,8 +1,7 @@
 """Tests for roads whose pavement is tagged on the road (sidewalk=*)."""
 
-import pytest
-
 from guide_core.walk_costs import CostConfig, edge_cost, has_sidewalk
+import pytest
 
 
 @pytest.mark.parametrize('value, expected', [

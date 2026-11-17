@@ -2,9 +2,8 @@
 
 import math
 
-import pytest
-
 from guide_core.route import InvalidRouteError, Route, route_from_dict
+import pytest
 
 L_ROUTE = [[0.0, 0.0], [40.0, 0.0], [40.0, 30.0]]
 
@@ -118,9 +117,10 @@ def test_from_dict_missing_waypoints():
 def test_from_dict_not_a_mapping(data):
     with pytest.raises(InvalidRouteError):
         route_from_dict(data)
-        
+
 # --- Projection --------------------------------------------------------------
 # L route: (0,0) -> (40,0) heading east, then (40,0) -> (40,30) heading north.
+
 
 def test_point_on_route():
     p = Route(L_ROUTE).project(10.0, 0.0)
@@ -222,8 +222,8 @@ def test_projection_is_frozen():
     p = Route(L_ROUTE).project(10.0, 0.0)
     with pytest.raises(AttributeError):
         p.s = 0.0
-        
-        
+
+
 # --- point_at / segment_index_at / heading_at --------------------------------
 
 @pytest.mark.parametrize('s, expected', [

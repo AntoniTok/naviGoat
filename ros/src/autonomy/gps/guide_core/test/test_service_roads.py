@@ -1,8 +1,7 @@
 """Tests for service roads (campus and access roads, driveways) in walk_costs."""
 
-import pytest
-
 from guide_core.walk_costs import CostConfig, edge_cost, is_minor_service
+import pytest
 
 
 def test_service_road_factor_default():

@@ -52,7 +52,8 @@ def generate_launch_description():
         DeclareLaunchArgument('start_y', default_value='0.0',
                               description='Sim robot start, metres north of the origin'),
         DeclareLaunchArgument('start_yaw_deg', default_value='0.0',
-                              description='Sim robot start heading, degrees (0 = east, 90 = north)'),
+                              description='Sim robot start heading, degrees '
+                                          '(0 = east, 90 = north)'),
     ]
 
     # Each Node action starts one executable (the same as 'ros2 run package executable').

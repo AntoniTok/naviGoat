@@ -6,13 +6,13 @@ robot stops before it). Junction nodes carry junction_major_dirs /
 junction_minor_dirs (road directions of each class, set by fetch_osm_graph).
 """
 
-import networkx as nx
-import pytest
-
 from guide_core.geo import enu_to_latlon
 from guide_core.route_planner import PlannerConfig, RoutePlanner
-from guide_core.walk_costs import (CrossingType, crossed_road_at_junction,
-                                   crossed_road_leaving_junction, edge_cost)
+from guide_core.walk_costs import (
+    crossed_road_at_junction, crossed_road_leaving_junction, CrossingType, edge_cost,
+)
+import networkx as nx
+import pytest
 
 ORIGIN = (51.4988, -0.1749)
 # A minor road straight across a major road: 2 directions of each.
@@ -58,7 +58,7 @@ def test_crossed_road_at_junction(highway, major, minor, expected):
 # --- route_planner ----------------------------------------------------------------
 
 def _graph(detour):
-    """A minor road N-J-S (30 m) straight across a major road at junction J (0, 0).
+    """Return a minor road N-J-S (30 m) straight across a major road at junction J (0, 0).
 
     With detour set, there is also a pavement route via a signalled crossing
     `detour` m east: N -> NE -> crossing -> SE -> S, cost 2 x detour + 30 + 20.

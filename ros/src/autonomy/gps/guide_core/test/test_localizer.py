@@ -2,17 +2,11 @@
 
 import math
 
-import pytest
-
 from guide_core.geo import enu_to_latlon
 from guide_core.localizer import (
-    UNKNOWN_VARIANCE,
-    GpsFix,
-    GpsLocalizer,
-    InvalidFixError,
-    PositionEstimate,
-    pose_covariance_6x6,
+    GpsFix, GpsLocalizer, InvalidFixError, pose_covariance_6x6, PositionEstimate, UNKNOWN_VARIANCE,
 )
+import pytest
 
 ORIGIN_LAT = 51.4988
 ORIGIN_LON = -0.1749
@@ -34,7 +28,7 @@ def make_fix(east=0.0, north=0.0, status=0,
 
 @pytest.fixture
 def localizer():
-    """A localizer at the standard test origin with the default variance."""
+    """Return a localizer at the standard test origin with the default variance."""
     return GpsLocalizer(ORIGIN_LAT, ORIGIN_LON)
 
 

@@ -2,12 +2,11 @@
 
 import math
 
-import pytest
-
 from guide_core.walk_costs import (
-    CostConfig, CrossingType, WalkwayClass, classify_crossing, crossing_penalty,
-    edge_cost, walkway_class,
+    classify_crossing, CostConfig, crossing_penalty, CrossingType, edge_cost, walkway_class,
+    WalkwayClass,
 )
+import pytest
 
 S = CrossingType.SIGNALLED
 U = CrossingType.UNSIGNALLED

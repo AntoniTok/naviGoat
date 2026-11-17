@@ -10,3 +10,6 @@ __pycache__/
 /weights/
 /Log/
 pete.env
+/build_host/
+/install_host/
+/log_host/

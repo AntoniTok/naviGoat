@@ -9,11 +9,11 @@
 
   <exec_depend>launch</exec_depend>
   <exec_depend>launch_ros</exec_depend>
-  <exec_depend>guide_sim</exec_depend>
   <exec_depend>guide_nodes</exec_depend>
   <exec_depend>rviz2</exec_depend>
+  <!-- guide_sim is NOT a dependency: the robot's build leaves it out. Only
+       guide.launch.py sim:=true and mission.launch.py (dev) need it. -->
 
-  <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>
   <test_depend>ament_pep257</test_depend>
   <test_depend>python3-pytest</test_depend>

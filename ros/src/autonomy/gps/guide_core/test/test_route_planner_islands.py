@@ -14,12 +14,11 @@ The island I1-I2 is either a footway=traffic_island way (default) or, as on
 Cromwell Road, a plain footway with crossing:island=no on both halves.
 """
 
-import networkx as nx
-import pytest
-
 from guide_core.geo import enu_to_latlon
 from guide_core.route_planner import PlannerConfig, RoutePlanner
 from guide_core.walk_costs import CostConfig
+import networkx as nx
+import pytest
 
 ORIGIN = (51.4988, -0.1749)
 CROSSING_NODE = {'highway': 'crossing', 'crossing': 'traffic_signals', 'crossed_road': 'major'}
@@ -41,7 +40,7 @@ def _add_way(graph, nodes, tags):
 
 
 def road_graph(detour, island_way=ISLAND_WAY, halves=CROSSING_WAY):
-    """The two-option graph above, with the single-stage crossing `detour` m east."""
+    """Return the two-option graph above, with the single-stage crossing `detour` m east."""
     g = nx.MultiDiGraph()
     _add_node(g, 'S0', -100, 0)
     _add_node(g, 'N0', -100, 18)

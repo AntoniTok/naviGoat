@@ -2,17 +2,16 @@
 
 import math
 
-import pytest
-
 from guide_core.route import Route
 from guide_core.route_follower import FollowerConfig, RouteFollower
+import pytest
 
 # L route: 40 m east, then 30 m north. Total 70 m, one corner at s = 40.
 L_ROUTE = Route([[0.0, 0.0], [40.0, 0.0], [40.0, 30.0]])
 
 
 def follower(route=L_ROUTE):
-    """A follower with the default config (lookahead 25, release 1.5, update 5)."""
+    """Return a follower with the default config (lookahead 25, release 1.5, update 5)."""
     return RouteFollower(route)
 
 
@@ -181,8 +180,6 @@ def test_full_pass_along_l_route():
     assert [g.is_final for g in goals] == [False] * 6 + [True]
     assert goals[3].yaw == pytest.approx(math.pi / 2)
     assert arrived_at == pytest.approx(69.0)  # 1.0 m tolerance
-    
-    
 
 
 # --- Corner safety net (confirm_goal_reached) --------------------------------

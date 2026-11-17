@@ -8,8 +8,8 @@ writes them to a route file), the route follower (which stops before them)
 and, from Step 7, the mission manager (which gets them from PlanRoute).
 """
 
-import math
 from dataclasses import dataclass
+import math
 
 from guide_core.route import InvalidRouteError
 from guide_core.walk_costs import CrossingType
@@ -33,8 +33,11 @@ _ROAD_RANK = {'none': 0, 'minor': 1, 'unknown': 2, 'major': 3}
 
 
 class CrossingError(InvalidRouteError):
-    """Crossing data is invalid. A subclass of InvalidRouteError, so code
-    that already handles bad route files also handles bad crossings."""
+    """Crossing data is invalid.
+
+    A subclass of InvalidRouteError, so code that already handles bad route
+    files also handles bad crossings.
+    """
 
 
 @dataclass(frozen=True)

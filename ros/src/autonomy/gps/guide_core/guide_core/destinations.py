@@ -18,13 +18,13 @@ Pure Python (no ROS): the mission manager node loads the YAML and copies the
 results into ROS messages.
 """
 
+from dataclasses import dataclass
 import difflib
+from enum import Enum
 import math
 import re
-import unicodedata
-from dataclasses import dataclass
-from enum import Enum
 from typing import Optional, Tuple
+import unicodedata
 
 from guide_core.geo import latlon_to_enu
 
@@ -225,7 +225,7 @@ def format_distance(metres):
 
 
 def describe(candidate):
-    """'Central Library, main entrance, step-free, about 300 m' (parts that exist)."""
+    """Return 'Central Library, main entrance, step-free, about 300 m' (parts that exist)."""
     parts = [candidate.destination.name]
     if candidate.destination.note:
         parts.append(candidate.destination.note)

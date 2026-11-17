@@ -7,14 +7,11 @@ Planner graph (metres east, north of the origin), from A0 (0, 10) to B0 (0, -110
   Surface detour:    A - M (east, -50) - B, 2 x sqrt(east^2 + 50^2) m
 """
 
-import math
-
-import networkx as nx
-import pytest
-
 from guide_core.geo import enu_to_latlon
 from guide_core.route_planner import PlannerConfig, RoutePlanner
 from guide_core.walk_costs import CostConfig, edge_cost
+import networkx as nx
+import pytest
 
 ORIGIN = (51.4988, -0.1749)
 FOOTWAY = {'highway': 'footway'}

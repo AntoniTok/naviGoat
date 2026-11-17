@@ -1,6 +1,7 @@
-from setuptools import find_packages, setup
-import os
 from glob import glob
+import os
+
+from setuptools import find_packages, setup
 
 package_name = 'guide_bringup'
 
@@ -25,6 +26,8 @@ setup(
             glob('osm/*.graphml') + glob('osm/*.meta.yaml')),
         (os.path.join('share', package_name, 'rviz'), glob('rviz/*.rviz')),
         (os.path.join('share', package_name, 'sim'), glob('sim/*.yaml')),
+        # Step 10: the parameter file (origin, topic names, frames, Nav2 action).
+        (os.path.join('share', package_name, 'config'), glob('config/*.yaml')),
     ],
     install_requires=['setuptools'],
     zip_safe=True,

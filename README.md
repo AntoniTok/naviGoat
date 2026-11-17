@@ -56,3 +56,7 @@ ros2 launch bringup launch.py
 ```
 
 ## [Simulation](ros/src/simulation/README.md)
+
+## [GPS navigation](ros/src/autonomy/gps/README.md)
+
+Long walks outdoors: "GPS take me to ..." plans a route on OpenStreetMap and feeds Nav2 goals along it, stopping at every road crossing until the user's go. Build the image with `--build-arg GPS=true`.

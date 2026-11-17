@@ -1,3 +1,6 @@
+from glob import glob
+import os
+
 from setuptools import find_packages, setup
 
 package_name = 'guide_sim'
@@ -10,6 +13,10 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
+        # Step 10: canned Nominatim answers for fake_nominatim (guide.launch.py
+        # sim:=true), copied from guide_core/test/data. glob() runs at build time.
+        (os.path.join('share', package_name, 'nominatim'),
+            glob('nominatim/*.json') + glob('nominatim/*.md')),
     ],
     install_requires=['setuptools'],
     zip_safe=True,

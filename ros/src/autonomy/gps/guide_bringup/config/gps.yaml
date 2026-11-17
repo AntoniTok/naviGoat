@@ -1,0 +1,47 @@
+# Settings of the GPS navigation layer, in one file (Step 10).
+# Loaded by guide.launch.py and mission.launch.py; pass your own copy with
+#   ros2 launch guide_bringup guide.launch.py params_file:=/path/to/gps.yaml
+#
+# File paths (OSM graph, destination list, geocode cache) are launch arguments
+# instead: a parameter file cannot point into the folder a package is
+# installed in. The online-search switch is the launch argument online_lookup.
+#
+# "/**" means every node. A node ignores the parameters it does not declare,
+# so values every node shares are given once, here.
+/**:
+  ros__parameters:
+    # Origin of the enu frame: routes and poses are metres east / north of it.
+    # It must lie inside the area of the OSM graph.
+    origin_lat: 51.4988
+    origin_lon: -0.1749
+
+# GPS + SLAM fusion. The robot's drivers must publish on these topics.
+localizer:
+  ros__parameters:
+    gps_topic: /gps/fix          # sensor_msgs/NavSatFix (no driver yet)
+    imu_topic: /imu/data         # sensor_msgs/Imu with an orientation (heading)
+    map_frame: map               # RTAB-Map's frame
+    base_frame: base_link        # the robot's body frame
+
+# Our client of Nav2.
+goal_sender:
+  ros__parameters:
+    action_name: navigate_to_pose   # Nav2's NavigateToPose action server
+    nav_frame: map                  # the frame Nav2 plans in
+
+# The team's topics (see the README's topic tables).
+gps_bridge:
+  ros__parameters:
+    mode_topic: /middleman/mode
+    go_topic: /gps/go
+    response_topic: /pete/response
+    done_topic: /middleman/done
+    failed_topic: /middleman/failed
+    status_topic: /gps/status
+    crossing_wait_topic: /gps/crossing_wait
+    health_topic: /gps/health
+    gps_mode: gps                   # the middleman's mode name for "GPS take me to ..."
+    # For the health check only: keep these equal to localizer.gps_topic and
+    # goal_sender.action_name above.
+    gps_topic: /gps/fix
+    nav2_action: navigate_to_pose

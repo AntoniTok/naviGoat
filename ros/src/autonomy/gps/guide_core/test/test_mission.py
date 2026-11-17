@@ -2,14 +2,13 @@
 
 import math
 
-import pytest
-
 from guide_core.destinations import Destination
 from guide_core.mission import (
-    CallPlanner, ClearRoute, ConfirmCrossing, CrossingInfo, Finish, Mission, MissionConfig,
-    MissionError, MissionGoal, MissionState, NavStatus, Pause, PlanSummary, Progress,
-    Resume, SendRoute, StopRobot, build_summary, describe_crossing,
+    build_summary, CallPlanner, ClearRoute, ConfirmCrossing, CrossingInfo, describe_crossing,
+    Finish, Mission, MissionConfig, MissionError, MissionGoal, MissionState, NavStatus, Pause,
+    PlanSummary, Progress, Resume, SendRoute, StopRobot,
 )
+import pytest
 
 STATION = Destination('South Kensington Station', 51.4941, -0.1738,
                       aliases=('south ken',), note='end of the pedestrian subway, step-free')
@@ -26,7 +25,7 @@ GOAL = MissionGoal(destination='south ken')
 
 
 def planned_mission(goal=GOAL):
-    """A mission in READY: started and planned (the demo plan)."""
+    """Return a mission in READY: started and planned (the demo plan)."""
     m = Mission(DESTINATIONS)
     (call,) = m.start(goal, ROBOT)
     m.on_plan_result(call.plan_id, True, 'ok', DEMO_PLAN)
@@ -34,7 +33,7 @@ def planned_mission(goal=GOAL):
 
 
 def active_mission():
-    """A mission in NAVIGATING: the user pressed go and the follower took route 1."""
+    """Return a mission in NAVIGATING: the user pressed go, the follower took route 1."""
     m = planned_mission()
     reply = m.on_go(now=0.0)
     (send,) = reply.commands
@@ -334,6 +333,7 @@ def test_pause_from_elsewhere_is_shown():
     assert m.state is MissionState.PAUSED
     assert m.snapshot().message == 'Paused. Press go to continue.'
 
+
 def test_pause_message_changes_once_when_confirmed():
     # The user hears "Paused." once, when the goal sender confirms it.
     m = active_mission()
@@ -344,6 +344,7 @@ def test_pause_message_changes_once_when_confirmed():
     assert m.version == v + 1
     assert m.snapshot().state is MissionState.PAUSED
     assert m.snapshot().message == 'Paused.'
+
 
 def test_arrival_finishes_mission():
     m = active_mission()

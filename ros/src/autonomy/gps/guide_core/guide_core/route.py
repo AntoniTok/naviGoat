@@ -5,12 +5,11 @@ joined by straight segments. Distances "along the route" are measured from
 the first waypoint and are called s throughout guide_core.
 """
 
-import math
+import bisect
 from dataclasses import dataclass
+import math
 from numbers import Real
 from typing import Any, Iterable, Optional, Sequence
-
-import bisect
 
 from guide_core.angles import wrap_angle
 
@@ -110,7 +109,7 @@ class Route:
         directions = tuple(
             ((end[0] - start[0]) / length, (end[1] - start[1]) / length)
             for start, end, length in zip(points, points[1:], segment_lengths))
-        
+
         # Heading of each segment: 0 = east, counter-clockwise positive (REP 103).
         headings = tuple(math.atan2(dy, dx) for dx, dy in directions)
 
@@ -142,7 +141,7 @@ class Route:
 
     @property
     def num_segments(self) -> int:
-        """Number of segments (one fewer than the number of points)."""
+        """Return the number of segments (one fewer than the number of points)."""
         return len(self._segment_lengths)
 
     def project(self, x: float, y: float,
@@ -204,7 +203,7 @@ class Route:
         # The clamped window always overlaps at least one segment.
         assert best is not None
         return best
-    
+
     def segment_index_at(self, s: float) -> int:
         """Return the index of the segment containing distance s.
 

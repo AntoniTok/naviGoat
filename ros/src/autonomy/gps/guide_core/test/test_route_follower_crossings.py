@@ -5,12 +5,11 @@ The tests without crossings live in test_route_follower.py and are unchanged.
 
 import math
 
-import pytest
-
 from guide_core.crossings import CrossingError, RouteCrossing
 from guide_core.route import InvalidRouteError, Route
 from guide_core.route_follower import FollowerConfig, RouteFollower
 from guide_core.walk_costs import CrossingType
+import pytest
 
 # Straight route, 100 m east. One crossing from s = 50 to 58: stop at 48.5.
 STRAIGHT = Route([[0.0, 0.0], [100.0, 0.0]])
@@ -25,7 +24,7 @@ L_ROUTE = Route([[0.0, 0.0], [40.0, 0.0], [40.0, 30.0]])
 
 
 def _crossing(start, end):
-    """A signalled major-road crossing from start to end (m along the route)."""
+    """Return a signalled major-road crossing from start to end (m along the route)."""
     return RouteCrossing(start, end, CrossingType.SIGNALLED, 'major', True)
 
 

@@ -1,10 +1,9 @@
 """Tests for start/goal snapping (walkways first, roads as a fallback) and plan warnings."""
 
-import networkx as nx
-import pytest
-
 from guide_core.geo import enu_to_latlon
 from guide_core.route_planner import PlannerConfig, RoutePlanner
+import networkx as nx
+import pytest
 
 ORIGIN = (51.4988, -0.1749)
 FOOTWAY = {'highway': 'footway'}
@@ -32,7 +31,7 @@ def _plan(graph, start, goal, config=None):
 
 
 def street():
-    """A pavement S-G (40 m) and, 10 m south, a road R1-R2 joined to it by roads."""
+    """Return a pavement S-G (40 m) and, 10 m south, a road R1-R2 joined to it by roads."""
     nodes = {'S': (0, 0, {}), 'G': (40, 0, {}), 'R1': (0, -10, {}), 'R2': (40, -10, {})}
     ways = [(['S', 'G'], SIDEWALK), (['S', 'R1', 'R2', 'G'], ROAD)]
     return _graph(nodes, ways)

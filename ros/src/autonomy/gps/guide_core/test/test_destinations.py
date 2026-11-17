@@ -1,11 +1,10 @@
 """Tests for guide_core.destinations (curated destination list and matching)."""
 
-import pytest
-
 from guide_core.destinations import (
-    Destination, DestinationError, MatchConfig, MatchType, Outcome,
-    destinations_from_dict, format_distance, normalise, resolve,
+    Destination, DestinationError, destinations_from_dict, format_distance, MatchConfig, MatchType,
+    normalise, Outcome, resolve,
 )
+import pytest
 
 CENTRAL = Destination('Central Library', 51.4987, -0.1779,
                       aliases=('library', 'abbey library'), note='main entrance, step-free')

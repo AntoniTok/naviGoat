@@ -1,6 +1,7 @@
 """Localizer v1 node: GPS + IMU heading + SLAM pose -> robot pose in ENU (Step 8).
 
-Subscribes to gps/fix (NavSatFix) and imu/data (Imu), and reads the robot's
+Subscribes to the GPS fix (NavSatFix, parameter gps_topic, default gps/fix)
+and the IMU (Imu, parameter imu_topic, default imu/data), and reads the robot's
 SLAM pose from TF (map -> base_link: RTAB-Map's map -> odom followed by the
 base driver's odom -> base_link; on the simulator, sim_robot publishes both).
 The alignment filter (guide_core.alignment) estimates T = where the map frame
@@ -90,6 +91,11 @@ class LocalizerNode(Node):
         self.pose_frame = self.declare_parameter('pose_frame', 'enu').value
         # frame_id for ENU on guide/map_in_enu.
         self.enu_frame = self.declare_parameter('enu_frame', 'enu').value
+        # Sensor topics (Step 10). Set in config/gps.yaml to the names the robot's
+        # GPS and IMU drivers publish on. A name without a leading '/' is relative,
+        # so it can be namespaced or remapped at launch.
+        gps_topic = self.declare_parameter('gps_topic', 'gps/fix').value
+        imu_topic = self.declare_parameter('imu_topic', 'imu/data').value
         pose_rate = self.declare_parameter('pose_rate', 10.0).value
         status_rate = self.declare_parameter('status_rate', 2.0).value
 
@@ -124,12 +130,11 @@ class LocalizerNode(Node):
         # --- Subscribers ---
         # create_subscription(type, topic, callback, qos): every time a
         # message arrives on the topic, ROS calls the callback with it.
-        # Topic names without a leading '/' are relative, so they can be
-        # remapped or namespaced at launch.
+        # The topic names come from the parameters above.
         self.gps_sub = self.create_subscription(
-            NavSatFix, 'gps/fix', self.on_gps_fix, qos_profile_sensor_data)
+            NavSatFix, gps_topic, self.on_gps_fix, qos_profile_sensor_data)
         self.imu_sub = self.create_subscription(
-            Imu, 'imu/data', self.on_imu, qos_profile_sensor_data)
+            Imu, imu_topic, self.on_imu, qos_profile_sensor_data)
 
         # --- Timers ---
         # The pose is published at a steady rate from the latest SLAM pose (not
@@ -138,9 +143,9 @@ class LocalizerNode(Node):
         self.create_timer(1.0 / status_rate, self.publish_status)
 
         self.get_logger().info(
-            f'Localizer v1 started: origin=({origin_lat}, {origin_lon}), SLAM pose from TF '
-            f'{self.map_frame} -> {self.base_frame}, publishing guide/pose '
-            f'(frame "{self.pose_frame}")')
+            f'Localizer v1 started: origin=({origin_lat}, {origin_lon}), GPS on {gps_topic}, '
+            f'IMU on {imu_topic}, SLAM pose from TF {self.map_frame} -> {self.base_frame}, '
+            f'publishing guide/pose (frame "{self.pose_frame}")')
 
     # --- Helpers ---
 

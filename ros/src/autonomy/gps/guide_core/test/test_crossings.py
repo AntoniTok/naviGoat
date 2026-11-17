@@ -2,13 +2,13 @@
 
 import math
 
-import pytest
-
 from guide_core.crossings import (
-    CrossingError, RouteCrossing, crossings_from_dict, crossings_to_dicts,
-    prepare_crossings, stop_points)
+    CrossingError, crossings_from_dict, crossings_to_dicts, prepare_crossings, RouteCrossing,
+    stop_points,
+)
 from guide_core.route import InvalidRouteError, Route
 from guide_core.walk_costs import CrossingType
+import pytest
 
 SIG = CrossingType.SIGNALLED
 UNSIG = CrossingType.UNSIGNALLED
@@ -21,7 +21,7 @@ def _c(start, end, crossing_type=SIG, road='major', tactile=False, island=False)
 
 
 def _route(length=100.0):
-    """A straight route of the given length along x."""
+    """Return a straight route of the given length along x."""
     return Route([[0.0, 0.0], [length, 0.0]])
 
 

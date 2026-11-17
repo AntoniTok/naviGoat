@@ -1,4 +1,4 @@
-"""Mission state machine: one journey from "take me to X" to "you have arrived".
+r"""Mission state machine: one journey from "take me to X" to "you have arrived".
 
 Pure Python (no ROS). The mission manager node feeds events in (a goal,
 the planner's answer, route progress, the paused flag, Nav2 statuses, the
@@ -15,7 +15,7 @@ from the follower (guide/route_progress) and the goal sender (guide/paused),
 never decided here, so the nodes cannot disagree.
 
     IDLE -> PLANNING -> READY --go--> NAVIGATING <-> WAITING_AT_CROSSING
-                                          ^  \\--------> PAUSED (pause / Nav2 failure)
+                                          ^  \--------> PAUSED (pause / Nav2 failure)
                                           +--------------/ (go)
     NAVIGATING -> ARRIVED;  any failure -> FAILED;  cancel -> IDLE
 
@@ -40,18 +40,14 @@ Without any on_localization call the quality counts as GOOD, so the machine
 behaves exactly as before Step 8.
 """
 
-import math
 from dataclasses import dataclass
 from enum import Enum, IntEnum
+import math
 from typing import Optional, Tuple
 
-from guide_core.destinations import (
-    Destination, MatchConfig, Outcome, format_distance, resolve,
-)
+from guide_core.destinations import Destination, format_distance, MatchConfig, Outcome, resolve
 from guide_core.localization_quality import Quality
-from guide_core.online_resolve import (
-    FOUND_IN_CACHE, FOUND_ONLINE, LARGE_AREA_NOTE, resolve_online,
-)
+from guide_core.online_resolve import FOUND_IN_CACHE, FOUND_ONLINE, LARGE_AREA_NOTE, resolve_online
 
 
 class MissionState(IntEnum):
@@ -285,7 +281,7 @@ def describe_crossing(info):
 
 def build_summary(name, note, plan, snap_report_distance, skip_confirmation=False,
                   found_in='', large_area=False):
-    """The read-back sentence for READY (pure text; tested on its own).
+    """Return the read-back sentence for READY (pure text; tested on its own).
 
     "South Kensington Station, end of the subway. About 650 m walk, 6 road
     crossings, 2 with an island. Warning: route uses 193 m of tunnel (no GPS
@@ -389,7 +385,7 @@ class Mission:
         }[self._phase]
 
     def can_accept(self):
-        """True if a new goal may start now (otherwise reject it: BUSY)."""
+        """Return True if a new goal may start now (otherwise reject it: BUSY)."""
         return self._phase in (_Phase.IDLE, _Phase.ARRIVED, _Phase.FAILED)
 
     def snapshot(self):
@@ -409,9 +405,12 @@ class Mission:
     # --- goal lifecycle ---
 
     def start(self, goal, robot_latlon):
-        """A NavigateTo goal was accepted. robot_latlon: (lat, lon), or None if no
-        recent position. Returns commands (CallPlanner, LookUpOnline when the
-        curated list has no match, or Finish on failure)."""
+        """Start the mission for an accepted NavigateTo goal.
+
+        robot_latlon: (lat, lon), or None if no recent position. Returns
+        commands (CallPlanner, LookUpOnline when the curated list has no
+        match, or Finish on failure).
+        """
         if not self.can_accept():
             raise RuntimeError('start() while a mission is running; check can_accept()')
         self._reset_mission()
@@ -451,7 +450,7 @@ class Mission:
         return self._plan_to(target, robot_latlon, goal.skip_confirmation)
 
     def on_lookup_result(self, lookup_id, status, destinations=(), from_cache=False):
-        """The geocoder answered (or failed: pass status OFFLINE).
+        """Take the geocoder's answer (or its failure: pass status OFFLINE).
 
         status: the Geocode response status; destinations: its candidates as
         Destinations (source 'nominatim'), in its order. One result -> plan
@@ -472,7 +471,7 @@ class Mission:
                              FOUND_IN_CACHE if from_cache else FOUND_ONLINE)
 
     def on_plan_result(self, plan_id, success, message, plan=None):
-        """The planner answered (plan is a PlanSummary when success is True)."""
+        """Take the planner's answer (plan is a PlanSummary when success is True)."""
         if (self._phase not in (_Phase.PLANNING, _Phase.REROUTING)
                 or plan_id != self._plan_id):
             return ()  # answer to a cancelled or older request
@@ -500,7 +499,7 @@ class Mission:
         return ()
 
     def on_route_set(self, route_id, success, message, sent_stamp=-math.inf):
-        """The follower answered guide/set_route.
+        """Take the follower's answer to guide/set_route.
 
         sent_stamp: time (s) the request was sent; goal statuses stamped at or
         before it belong to an earlier route (the topic is latched) and are ignored.
@@ -521,7 +520,7 @@ class Mission:
         return ()
 
     def cancel(self):
-        """The NavigateTo goal was cancelled: stop everything, back to IDLE."""
+        """Cancel the NavigateTo goal: stop everything, back to IDLE."""
         if self._phase in (_Phase.ARRIVED, _Phase.FAILED, _Phase.IDLE):
             return ()
         commands = []
@@ -548,7 +547,7 @@ class Mission:
         return self._after_change()
 
     def on_progress(self, progress, robot_latlon=None):
-        """A guide/route_progress message (ignored unless it is for our route).
+        """Take a guide/route_progress message (ignored unless it is for our route).
 
         robot_latlon: the robot's (lat, lon) now, needed only to plan a new
         route when progress.off_route says the robot has left this one.
@@ -588,8 +587,11 @@ class Mission:
         return self._check_localization() + self._after_change()
 
     def on_nav_status(self, status, stamp):
-        """A guide/goal_status message. stamp: its header time (seconds), used to
-        skip repeats; only ABORTED and REJECTED matter (CANCELED = our own pause)."""
+        """Take a guide/goal_status message.
+
+        stamp: its header time (seconds), used to skip repeats; only ABORTED
+        and REJECTED matter (CANCELED = our own pause).
+        """
         if self._phase is not _Phase.ACTIVE or stamp <= self._last_status_stamp:
             return ()
         self._last_status_stamp = stamp
@@ -611,16 +613,19 @@ class Mission:
         return (Pause(),)
 
     def on_confirm_result(self, success, text):
-        """The follower answered guide/confirm_crossing."""
+        """Take the follower's answer to guide/confirm_crossing."""
         if not success:
             self._set_message(f'Could not start the crossing: {text}')
         return ()
 
     def on_service_failed(self, command, text):
-        """A Pause / Resume / ConfirmCrossing / StopRobot / ClearRoute call failed
-        (service missing or error). Clears the 'pending' flag so the user can try
-        again, and tells the user. (Planner and set_route failures go through
-        on_plan_result / on_route_set with success=False instead.)"""
+        """Handle a failed Pause / Resume / ConfirmCrossing / StopRobot / ClearRoute call.
+
+        The service was missing or answered with an error. Clears the
+        'pending' flag so the user can try again, and tells the user.
+        (Planner and set_route failures go through on_plan_result /
+        on_route_set with success=False instead.)
+        """
         if isinstance(command, Pause):
             self._pause_pending = False
             self._pause_text = ''
@@ -632,7 +637,7 @@ class Mission:
     # --- the user's inputs ---
 
     def on_go(self, now):
-        """The user's go: start / cross / resume, depending on the state."""
+        """Handle the user's go: start / cross / resume, depending on the state."""
         state = self.state
         if state not in (MissionState.READY, MissionState.WAITING_AT_CROSSING,
                          MissionState.PAUSED):
@@ -662,7 +667,7 @@ class Mission:
         return Reply(True, 'Crossing.', (ConfirmCrossing(),))
 
     def on_pause(self):
-        """The user's pause. Always obeyed while moving, even on a crossing."""
+        """Handle the user's pause. Always obeyed while moving, even on a crossing."""
         if self._phase is not _Phase.ACTIVE:
             return Reply(False, 'Not moving.')
         if self._paused or self._pause_pending:

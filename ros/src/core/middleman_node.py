@@ -11,14 +11,16 @@
                                                    search is spoken ("I couldn't find the chair.") and the mode goes back to idle
     description_topic    /scene_description   in   perception's description of the camera view, spoken through the response topic
     done_topic           /middleman/done      in   the robot reached the goal of a location, object or GPS request
+    failed_topic         /middleman/failed    in   the robot gave up on a location, object or GPS request: the text is the reason,
+                                                   ready to be spoken; it is said and the mode goes back to idle
     save_place_topic     /navigation/save_place  out  the name from "remember this place as X"; navigation saves the robot's position under it
     places_topic         /navigation/places   in   JSON list of the names navigation has saved (latched): understood like the catalog's places
 
 Every topic name above is a ROS parameter (the name in the first column, the default in the second), and so is use_qwen.
 
 Modes other than perception read /middleman/mode. Nothing subscribes to it yet.
-Goal modes end when the robot publishes /middleman/done. Following and manual mode have no goal: they end when
-the user says "stop", "exit manual mode" or "stop following".
+Goal modes end when the robot publishes /middleman/done, or /middleman/failed when it gives up. Following and manual
+mode have no goal: they end when the user says "stop", "exit manual mode" or "stop following".
 
     python3 middleman_node.py --ros-args -p use_qwen:=true
 """
@@ -27,12 +29,17 @@ import json
 
 from middleman import DESCRIBE, Middleman, Mode, qwen_interpreter
 
+# The modes that drive to a goal, so they can end in /middleman/done or /middleman/failed
+GOAL_MODES = (Mode.LOCATION, Mode.OBJECT, Mode.GPS)
+# Said when a failure report comes without a reason
+COULD_NOT_GET_THERE = "Sorry, I couldn't get there."
+
 # The topic parameters and their defaults. mode_topic and goal_topic are the names perception listens to.
 TOPICS = {
     'speech_topic': '/speech/text', 'response_topic': '/pete/response', 'middleman_mode_topic': '/middleman/mode',
     'heard_topic': '/middleman/heard', 'mode_topic': '/mode', 'goal_topic': '/goal', 'status_topic': '/object_status',
-    'description_topic': '/scene_description', 'done_topic': '/middleman/done', 'save_place_topic': '/navigation/save_place',
-    'places_topic': '/navigation/places'}
+    'description_topic': '/scene_description', 'done_topic': '/middleman/done', 'failed_topic': '/middleman/failed',
+    'save_place_topic': '/navigation/save_place', 'places_topic': '/navigation/places'}
 
 CANNOT_ANSWER = "Sorry, I can only describe what is in front of me."
 
@@ -107,6 +114,21 @@ def main():
         announce('idle')
         response_pub.publish(String(data='Arrived.'))
 
+    def on_failed(msg):
+        """Whoever drives a location / object / GPS goal gave up. The message is the reason, ready to be spoken.
+        fail() decides what comes next: a stored place can stand in for an object, otherwise the mode goes back to idle."""
+        if middleman.mode not in GOAL_MODES:  # a late report, after a stop or another request
+            node.get_logger().info(f'Failure report while not driving to a goal, ignored: {msg.data!r}')
+            return
+        decision = middleman.fail()
+        reason = msg.data.strip() or COULD_NOT_GET_THERE
+        if decision is not None:  # a stored place stands in for the object
+            announce(decision.mode.value, decision.target, decision.intent)
+            response_pub.publish(String(data=f'{reason} {decision.reply}'))
+        else:
+            announce('idle')
+            response_pub.publish(String(data=reason))
+
     def on_object_status(msg):
         """Perception's report at the end of a search: 'found:chair' or 'not_found:chair'. Only a failed search is spoken."""
         status, _, goal = msg.data.partition(':')
@@ -137,6 +159,7 @@ def main():
     group = ReentrantCallbackGroup()
     node.create_subscription(String, topic['speech_topic'], on_speech, 10, callback_group=group)
     node.create_subscription(String, topic['done_topic'], on_done, 10, callback_group=group)
+    node.create_subscription(String, topic['failed_topic'], on_failed, 10, callback_group=group)
     node.create_subscription(String, topic['status_topic'], on_object_status, 10, callback_group=group)
     node.create_subscription(String, topic['description_topic'], on_description, 10, callback_group=group)
     # navigation's saved places are latched, so the ones from earlier runs arrive as soon as this node starts

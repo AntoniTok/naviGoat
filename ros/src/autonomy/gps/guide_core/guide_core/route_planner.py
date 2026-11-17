@@ -9,19 +9,19 @@ nodes, so an edge's length is the straight-line distance in the local
 east-north (ENU) frame around the origin.
 """
 
-import math
 from dataclasses import dataclass, field
-
-import networkx as nx
+import math
 
 from guide_core.crossings import RouteCrossing
 from guide_core.geo import latlon_to_enu
 from guide_core.polyline import simplify_polyline
 from guide_core.route import MIN_SEGMENT_LENGTH, Route
-from guide_core.walk_costs import (CostConfig, CrossingType, WalkwayClass, classify_crossing,
-                                   crossed_road_at_junction, crossed_road_leaving_junction,
-                                   edge_cost, has_sidewalk,
-                                   is_island_tagged, is_road, is_tunnel, walkway_class)
+from guide_core.walk_costs import (
+    classify_crossing, CostConfig, crossed_road_at_junction, crossed_road_leaving_junction,
+    CrossingType, edge_cost, has_sidewalk, is_island_tagged, is_road, is_tunnel, walkway_class,
+    WalkwayClass,
+)
+import networkx as nx
 
 
 class PlanningError(ValueError):
@@ -237,17 +237,17 @@ class RoutePlanner:
 
     @property
     def config(self):
-        """The PlannerConfig in use."""
+        """Return the PlannerConfig in use."""
         return self._config
 
     @property
     def usable_node_count(self):
-        """Number of nodes a start or goal can snap to (surface nodes only)."""
+        """Return the number of nodes a start or goal can snap to (surface nodes only)."""
         return len(self._usable)
 
     @property
     def island_node_count(self):
-        """Number of pedestrian island nodes found in the graph."""
+        """Return the number of pedestrian island nodes found in the graph."""
         return len(self._island_nodes)
 
     def plan(self, start_lat, start_lon, goal_lat, goal_lon):
@@ -473,7 +473,7 @@ class RoutePlanner:
                             f'(limit {cfg.walkway_snap_distance:.1f} m).')
 
     def _find_crossings(self, path):
-        """Return (first, last, centre, type, crossed_road, tactile, island, junction) per crossing.
+        """Return (first, last, centre, type, road, tactile, island, junction) per crossing.
 
         A crossing is either a run of consecutive footway=crossing edges, split
         at island nodes (first/last = path indices of the near and far kerb,
@@ -547,7 +547,8 @@ class RoutePlanner:
             roads = {_value(tags, 'crossed_road') for tags in node_tags}
             crossed_road = ('major' if 'major' in roads else 'minor' if 'minor' in roads
                             else 'none' if 'none' in roads else 'unknown')
-            tactile = any(_value(tags, 'tactile_paving') == 'yes' for tags in node_tags + edge_tags)
+            tactile = any(_value(tags, 'tactile_paving') == 'yes'
+                          for tags in node_tags + edge_tags)
             island = (any(path[k] in self._island_nodes for k in range(first, last + 1))
                       or any(is_island_tagged(tags) for tags in edge_tags))
             result.append((first, last, centre, crossing_type, crossed_road, tactile, island,
