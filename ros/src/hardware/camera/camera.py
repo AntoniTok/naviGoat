@@ -13,6 +13,9 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import CameraInfo, CompressedImage, Image, PointCloud2, PointField
 
 CAMERA_QOS = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
+# The pictures are sent reliably, as the Orbbec driver sends them: the nodes that read them ask for reliable delivery
+# (best effort loses most large pictures), and a reliable reader gets nothing from a best-effort sender.
+IMAGE_QOS = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE)
 
 
 class FemtoBolt:
@@ -60,9 +63,9 @@ class Camera(Node):
         self.frame_id = param('frame_id', 'camera_color_optical_frame')
         self.camera = FemtoBolt(param('width', 1280), param('height', 720), param('fps', 30))
         self.bridge = CvBridge()
-        self.colour_pub = self.create_publisher(Image, '/camera/color/image_raw', CAMERA_QOS)
-        self.depth_pub = self.create_publisher(Image, '/camera/depth_registered/image_rect', CAMERA_QOS)
-        self.info_pub = self.create_publisher(CameraInfo, '/camera/color/camera_info', CAMERA_QOS)
+        self.colour_pub = self.create_publisher(Image, '/camera/color/image_raw', IMAGE_QOS)
+        self.depth_pub = self.create_publisher(Image, '/camera/depth_registered/image_rect', IMAGE_QOS)
+        self.info_pub = self.create_publisher(CameraInfo, '/camera/color/camera_info', IMAGE_QOS)
         self.cloud_pub = self.create_publisher(PointCloud2, '/camera/points', CAMERA_QOS)
         # A small jpeg preview to watch from another computer: full frames don't get through a USB or Wi-Fi link
         self.preview_pub = self.create_publisher(CompressedImage, '/camera/color/image_raw/compressed', CAMERA_QOS)
