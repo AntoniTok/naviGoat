@@ -1,0 +1,20 @@
+# Curated destinations for the mission manager (guide_core.destinations).
+# lat/lon = the point to walk TO: the (preferably step-free) entrance, NOT the
+# building's centre. It must be within the planner's snap distance of a walkway.
+# Names and aliases are matched case-, accent- and punctuation-insensitively;
+# a leading "the" is ignored. An alias shared by two places makes the user choose.
+#
+# Demo entries only (both checked with plan_route in Step 7.1): the team
+# replaces/extends these with real entrances.
+destinations:
+  - name: South Kensington Station
+    aliases: [south ken, south ken station, tube station]
+    lat: 51.4941
+    lon: -0.1738
+    note: end of the pedestrian subway, step-free
+
+  - name: Demo start point
+    aliases: [start, demo start]
+    lat: 51.4986289
+    lon: -0.1752868
+    note: start of the demo route, on the pavement
